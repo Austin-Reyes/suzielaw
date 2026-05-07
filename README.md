@@ -16,34 +16,31 @@ This repo is also the **canonical reference example** of the *"build your app in
 
 A quick walk through the surfaces a lawyer actually touches.
 
-![Suzie Law landing page](docs/screenshots/landing.png)
-**Vibe coding for lawyers.** The marketing site at [suzielaw.com](https://suzielaw.com) — open-source legal AI built on Team Suzie. Don't rent a chatbot; build agentic workflows you own.
-
-![Counsel chat](docs/screenshots/basic_chat.png)
+![Counsel chat](docs/screenshots/basic_chat.webp)
 **Counsel — the chat.** A clean composer with quick-start cards (draft email, summarise document, build a chronology, extract change-of-control). Files + Workflow buttons attach context inline; Counsel is the active persona, switchable from the sidebar.
 
-![Practice-area personas](docs/screenshots/personas.png)
+![Practice-area personas](docs/screenshots/personas.webp)
 **Personas — practice-area Counsels.** Twelve built-in personas (Arbitration, Business of Law, Capital Markets, Employment, IP, Litigation, M&A, Investigations, …) each with their own system prompt and tool subset. Click any to activate; create your own with the *New persona* button.
 
-![Workflow library](docs/screenshots/prompts.png)
+![Workflow library](docs/screenshots/prompts.webp)
 **Library — 160+ agentic workflows.** Recipes, not paste-and-pray prompts: *Analyze complaint*, *Antitrust compliance program assessment*, *DPIA / risk assessment*, *Build a discovery plan*, *Award enforcement strategy memo*, *Cartel conduct theory analysis*, judge financial-disclosure pulls, and more. Filter by practice area; click any tile to seed the chat.
 
-![Matter review grid](docs/screenshots/tables.png)
+![Matter review grid](docs/screenshots/tables.webp)
 **Matters — tabular review.** Drop a stack of documents into a matter and ask the same questions across all of them. Rows are documents, columns are questions; every cell is the agent's grounded answer. Add columns on the fly, export to spreadsheet, run only the pending cells.
 
-![Citations grounded in source](docs/screenshots/sourcing.png)
+![Citations grounded in source](docs/screenshots/sourcing.webp)
 **Sourcing — every claim is clickable.** Each answer carries inline citations to the underlying document. Click one and the source pane jumps to the highlighted passage — no fabricated authorities, no "trust me."
 
-![Case-law research](docs/screenshots/research.png)
+![Case-law research](docs/screenshots/research.webp)
 **Research — real US case law via CourtListener.** Ask for *"Ninth Circuit cases on qualified immunity from 2023"* and Counsel returns actual decisions with direct links to the opinion. Federal + state coverage; bring an API token to lift the rate limit.
 
-![Drafting to DOCX](docs/screenshots/drafting.png)
+![Drafting to DOCX](docs/screenshots/drafting.webp)
 **Drafting — live, with DOCX export.** Counsel proposes a TOC, fills section by section while keeping neighbouring sections coherent, and renders the draft live in a side panel. Download as Markdown or as a styled `.docx` that opens straight in Word.
 
-![Tracked-changes redline](docs/screenshots/markups.png)
+![Tracked-changes redline](docs/screenshots/markups.webp)
 **Markups — tracked-change redlines.** *"Redline this NDA from the buyer's perspective."* Counsel proposes per-clause edits as Accept / Reject cards in the chat; the side panel shows the proposed insertions and deletions inline; export a `.docx` with native Word tracked changes intact. Append-only version chain across upload → propose → accept/reject.
 
-![Settings — bring your own keys](docs/screenshots/settings.png)
+![Settings — bring your own keys](docs/screenshots/settings.webp)
 **Settings — BYOK, no lock-in.** Pick the model that powers Counsel (Claude, GPT, Qwen, or your own local server) and plug in your own provider keys. The key bypasses the demo budget and bills your account directly.
 
 ---
