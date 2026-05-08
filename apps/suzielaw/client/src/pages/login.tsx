@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { Button, Card, CardContent, CardHeader } from '@teamsuzie/ui';
 
 interface AuthProvider {
@@ -37,6 +37,34 @@ function GoogleMark() {
 export function LoginPage() {
   const [providers, setProviders] = useState<AuthProvider[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [email, setEmail] = useState('demo@example.com');
+  const [password, setPassword] = useState('demo');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleDemoLogin(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setSubmitting(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setError(body.error === 'invalid_credentials' ? 'Invalid email or password.' : 'Login failed.');
+        return;
+      }
+      window.location.href = '/';
+    } catch {
+      setError('Network error.');
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -85,9 +113,34 @@ export function LoginPage() {
             </Button>
           ))}
           {loaded && providers.length === 0 && (
-            <p className="text-center text-sm text-muted-foreground">
-              No sign-in providers are configured.
-            </p>
+            <form onSubmit={handleDemoLogin} className="flex flex-col gap-3">
+              <label className="flex flex-col gap-1 text-sm">
+                <span className="text-neutral-700">Email</span>
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  autoComplete="email"
+                  className="rounded-lg border border-neutral-200 px-3 py-2 text-sm shadow-sm focus:border-neutral-400 focus:outline-none"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-sm">
+                <span className="text-neutral-700">Password</span>
+                <input
+                  type="password"
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  autoComplete="current-password"
+                  className="rounded-lg border border-neutral-200 px-3 py-2 text-sm shadow-sm focus:border-neutral-400 focus:outline-none"
+                />
+              </label>
+              {error && <p className="text-sm text-red-600">{error}</p>}
+              <Button type="submit" disabled={submitting} className="w-full rounded-xl">
+                {submitting ? 'Signing in…' : 'Sign in'}
+              </Button>
+            </form>
           )}
         </CardContent>
       </Card>
