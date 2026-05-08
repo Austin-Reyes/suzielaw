@@ -76,7 +76,11 @@ export function easyAuthBridgeMiddleware(opts?: { budget?: TokenBudgetStore }): 
         email: identity.email,
         name: identity.name,
         role: identity.role,
-        authProvider: 'easyauth-entra',
+        // Easy Auth IS Microsoft auth, just enforced at the Container App
+        // ingress instead of in-app. Reuse 'microsoft' rather than introducing
+        // a new HostedDemoAuthProvider variant — the upstream type is shared
+        // with open_teamsuzie and we don't want to fork it.
+        authProvider: 'microsoft',
         authSubject: identity.email,
       });
     }
