@@ -8,7 +8,7 @@
     "moduleResolution": "bundler",
     "baseUrl": ".",
     "paths": {
-      "@teamsuzie/ui": ["../../../../open_teamsuzie/packages/ui/src/index.ts"]
+      "@teamsuzie/ui": ["../../../../agents/packages/ui/src/index.ts"]
     },
     "resolveJsonModule": true,
     "isolatedModules": true,

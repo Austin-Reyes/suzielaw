@@ -11,7 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TEAMSUZIE_DIR="$(cd "$ROOT_DIR/../open_teamsuzie" 2>/dev/null && pwd || true)"
+TEAMSUZIE_DIR="$(cd "$ROOT_DIR/../agents" 2>/dev/null && pwd || true)"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -22,7 +22,7 @@ warn() { echo -e "${YELLOW}[dev-up]${NC} $*"; }
 err()  { echo -e "${RED}[dev-up]${NC} $*" >&2; }
 
 if [ -z "${TEAMSUZIE_DIR:-}" ] || [ ! -d "$TEAMSUZIE_DIR" ]; then
-  err "expected sibling Team Suzie clone at $ROOT_DIR/../open_teamsuzie"
+  err "expected sibling Team Suzie clone at $ROOT_DIR/../agents"
   err "see README.md → Layout"
   exit 1
 fi

@@ -4,25 +4,25 @@ RUN corepack enable && corepack prepare pnpm@9 --activate
 WORKDIR /repo
 
 # This build context must contain both repos side by side.
-# The app depends on shared packages from open_teamsuzie.
-COPY open_teamsuzie/ open_teamsuzie/
-COPY suzielaw/ suzielaw/
+# The app depends on shared packages from the upstream framework (agents/).
+COPY agents/ agents/
+COPY app/ app/
 
-WORKDIR /repo/open_teamsuzie
+WORKDIR /repo/agents
 RUN pnpm install --frozen-lockfile=false && pnpm --filter "./packages/*" build
 
-WORKDIR /repo/suzielaw
+WORKDIR /repo/app
 RUN pnpm install --frozen-lockfile=false
-RUN pnpm --filter @suzielaw/assistant-client exec vite build
-RUN pnpm --filter @suzielaw/assistant build
+RUN pnpm --filter @counsel/assistant-client exec vite build
+RUN pnpm --filter @counsel/assistant build
 
 FROM node:20-bookworm-slim
 RUN corepack enable && corepack prepare pnpm@9 --activate
 WORKDIR /app
-COPY --from=builder /repo/open_teamsuzie /repo/open_teamsuzie
-COPY --from=builder /repo/suzielaw /repo/suzielaw
+COPY --from=builder /repo/agents /repo/agents
+COPY --from=builder /repo/app /repo/app
 
-WORKDIR /repo/suzielaw/apps/suzielaw
+WORKDIR /repo/app/apps/counsel
 ENV NODE_ENV=production
 EXPOSE 17501
 CMD ["node", "dist/index.js"]

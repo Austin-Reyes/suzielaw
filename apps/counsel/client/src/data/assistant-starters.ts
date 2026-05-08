@@ -3,7 +3,7 @@
  * These are intentionally inline (rather than pulled from
  * `/api/workflows`) so the greeting renders synchronously and the
  * starter cards never flicker on first paint. The full library lives
- * server-side in `apps/suzielaw/src/data/prompts.ts`; revisit if we
+ * server-side in `apps/counsel/src/data/prompts.ts`; revisit if we
  * find users editing these to match their day-to-day shortcuts.
  */
 export interface StarterPrompt {

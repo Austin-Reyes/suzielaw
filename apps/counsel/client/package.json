@@ -1,5 +1,5 @@
 {
-  "name": "@suzielaw/assistant-client",
+  "name": "@counsel/assistant-client",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -9,10 +9,10 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@teamsuzie/citations": "link:../../../../open_teamsuzie/packages/citations",
-    "@teamsuzie/chats": "link:../../../../open_teamsuzie/packages/chats",
-    "@teamsuzie/grid-review": "link:../../../../open_teamsuzie/packages/grid-review",
-    "@teamsuzie/ui": "link:../../../../open_teamsuzie/packages/ui",
+    "@teamsuzie/citations": "link:../../../../agents/packages/citations",
+    "@teamsuzie/chats": "link:../../../../agents/packages/chats",
+    "@teamsuzie/grid-review": "link:../../../../agents/packages/grid-review",
+    "@teamsuzie/ui": "link:../../../../agents/packages/ui",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-router-dom": "^7.1.1"

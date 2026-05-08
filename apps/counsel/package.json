@@ -1,0 +1,49 @@
+{
+  "name": "@counsel/assistant",
+  "version": "0.1.0",
+  "description": "Suzie Law chat assistant — Express + React on Team Suzie",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts & pnpm --filter @counsel/assistant-client dev & wait",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@teamsuzie/agent-loop": "link:../../../agents/packages/agent-loop",
+    "@teamsuzie/approvals": "link:../../../agents/packages/approvals",
+    "@teamsuzie/citations": "link:../../../agents/packages/citations",
+    "@teamsuzie/db-sqlite": "link:../../../agents/packages/db-sqlite",
+    "@teamsuzie/docx": "link:../../../agents/packages/docx",
+    "@teamsuzie/docx-diff": "link:../../../agents/packages/docx-diff",
+    "@teamsuzie/document-versions": "link:../../../agents/packages/document-versions",
+    "@teamsuzie/kb": "link:../../../agents/packages/kb",
+    "@teamsuzie/markdown-document": "link:../../../agents/packages/markdown-document",
+    "@teamsuzie/model-settings": "link:../../../agents/packages/model-settings",
+    "@teamsuzie/personas": "link:../../../agents/packages/personas",
+    "@teamsuzie/sharing": "link:../../../agents/packages/sharing",
+    "@teamsuzie/chats": "link:../../../agents/packages/chats",
+    "@teamsuzie/grid-review": "link:../../../agents/packages/grid-review",
+    "@teamsuzie/hosted-demo": "link:../../../agents/packages/hosted-demo",
+    "@teamsuzie/workflows": "link:../../../agents/packages/workflows",
+    "@teamsuzie/workspaces": "link:../../../agents/packages/workspaces",
+    "cookie-session": "^2.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.0",
+    "exceljs": "^4.4.0",
+    "express": "^5.1.0",
+    "multer": "^2.0.1"
+  },
+  "devDependencies": {
+    "@types/cookie-session": "^2.0.49",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.3",
+    "@types/multer": "^2.0.0",
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^3.2.4"
+  }
+}

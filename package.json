@@ -9,8 +9,8 @@
     "pnpm": ">=9"
   },
   "scripts": {
-    "deps:build": "cd ../open_teamsuzie && pnpm -r --filter './packages/**' build",
-    "dev": "pnpm --filter @suzielaw/assistant dev",
+    "deps:build": "cd ../agents && pnpm -r --filter './packages/**' build",
+    "dev": "pnpm --filter @counsel/assistant dev",
     "dev:full": "bash scripts/dev-up.sh",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck"
