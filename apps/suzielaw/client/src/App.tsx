@@ -174,7 +174,7 @@ export default function App() {
     };
   }, []);
 
-  const title = health?.title || 'Suzie Law';
+  const title = health?.title || 'RBL Counsel Assist';
   const agentName = health?.agent?.name || 'Counsel';
   const agentReachable = health?.agent?.reachable ?? false;
   const statusState: 'online' | 'offline' | 'pending' = !healthLoaded

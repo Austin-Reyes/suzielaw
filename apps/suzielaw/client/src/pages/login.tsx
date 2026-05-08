@@ -93,7 +93,7 @@ export function LoginPage() {
         <CardHeader>
           <div className="text-center">
             <div className="font-display text-5xl font-medium tracking-tight text-foreground">
-              Suzie Law
+              RBL Counsel Assist
             </div>
           </div>
         </CardHeader>
