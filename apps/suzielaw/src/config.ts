@@ -137,6 +137,16 @@ export const config = {
     cookieName: process.env.SUZIELAW_COOKIE_NAME || 'suzielaw.sid',
     /** Sign cookies. Use a long, random value in production. */
     cookieSecret: process.env.SUZIELAW_SESSION_SECRET || 'dev-only-suzielaw-secret',
+    /**
+     * When true, trust `x-ms-client-principal-name` / `x-ms-client-principal`
+     * headers as injected by Azure Container Apps Easy Auth. Auto-creates a
+     * session for the bearer of those headers, bypassing the demo login form.
+     * Only set this when you KNOW the app is deployed behind Easy Auth — if
+     * exposed without the auth gate, anyone can spoof the headers.
+     */
+    trustEasyAuth: ['1', 'true', 'yes'].includes(
+      (process.env.SUZIELAW_TRUST_EASY_AUTH || '').toLowerCase(),
+    ),
   },
   oauth: {
     providers: buildOAuthProvidersFromEnv({

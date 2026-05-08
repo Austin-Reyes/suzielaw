@@ -18,7 +18,13 @@ import {
   type ToolContext,
 } from '@teamsuzie/agent-loop';
 import { config } from './config.js';
-import { createAuthRouter, createSessionMiddleware, getSessionUser, requireAuth } from './auth.js';
+import {
+  createAuthRouter,
+  createSessionMiddleware,
+  easyAuthBridgeMiddleware,
+  getSessionUser,
+  requireAuth,
+} from './auth.js';
 import {
   createCsrfMiddleware,
   createOAuthRouter,
@@ -259,6 +265,10 @@ const app = express();
 app.use(cors({ origin: config.allowedOrigin, credentials: true }));
 app.use(express.json({ limit: '2mb' }));
 app.use(createSessionMiddleware());
+// Bridge Container Apps Easy Auth → cookie-session. No-op when
+// SUZIELAW_TRUST_EASY_AUTH is unset (local dev). Must run BEFORE requireAuth
+// is reachable so the auto-populated session is visible to it.
+app.use(easyAuthBridgeMiddleware({ budget: tokenBudget }));
 app.use(createCsrfMiddleware({ cookieName: 'suzielaw.csrf' }));
 app.use('/api', createAuthRouter({ budget: tokenBudget }));
 app.use(

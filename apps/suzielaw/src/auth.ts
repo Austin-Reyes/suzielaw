@@ -10,6 +10,81 @@ export interface SessionUser {
 }
 
 /**
+ * Read identity from Azure Container Apps Easy Auth headers, if present.
+ * Easy Auth (the platform-level auth in front of the Container App) injects
+ * these headers AFTER it has validated the upstream OAuth token, so we can
+ * trust them WITHOUT re-validating — but ONLY when we know we're running
+ * behind Easy Auth (i.e., env var SUZIELAW_TRUST_EASY_AUTH=true).
+ *
+ * If those headers are present and no session user exists yet, we
+ * auto-populate the session so the client sees an authenticated user and
+ * skips the login page entirely.
+ *
+ * Reference: https://learn.microsoft.com/en-us/azure/container-apps/authentication
+ */
+function readEasyAuthIdentity(req: Request): SessionUser | null {
+  if (!config.session.trustEasyAuth) return null;
+
+  // The simple header — UPN of the signed-in user (e.g., austin@reyeslaw.com).
+  const principalName = req.header('x-ms-client-principal-name');
+  if (!principalName) return null;
+
+  // The base64-encoded JSON claims principal — gives us the display name etc.
+  let displayName = principalName;
+  const encoded = req.header('x-ms-client-principal');
+  if (encoded) {
+    try {
+      const decoded = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8')) as {
+        claims?: Array<{ typ?: string; val?: string }>;
+      };
+      const nameClaim = decoded.claims?.find(
+        (c) =>
+          c.typ === 'name' ||
+          c.typ === 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name',
+      );
+      if (nameClaim?.val) displayName = nameClaim.val;
+    } catch {
+      // Malformed header — fall back to UPN as displayName.
+    }
+  }
+
+  return {
+    email: principalName.toLowerCase(),
+    name: displayName,
+    role: 'user',
+  };
+}
+
+/**
+ * Middleware: if Easy Auth headers are present and the cookie session has no
+ * user yet, populate it from Easy Auth. This makes Easy Auth the source of
+ * truth in production and the cookie-session a passive cache. The demo
+ * email/password flow remains intact for local dev (when SUZIELAW_TRUST_EASY_AUTH
+ * is off).
+ */
+export function easyAuthBridgeMiddleware(opts?: { budget?: TokenBudgetStore }): RequestHandler {
+  return (req, _res, next) => {
+    const session = req.session as { user?: SessionUser } | null;
+    if (session?.user) {
+      next();
+      return;
+    }
+    const identity = readEasyAuthIdentity(req);
+    if (identity) {
+      (req.session as { user?: SessionUser }).user = identity;
+      opts?.budget?.upsertAccount({
+        email: identity.email,
+        name: identity.name,
+        role: identity.role,
+        authProvider: 'easyauth-entra',
+        authSubject: identity.email,
+      });
+    }
+    next();
+  };
+}
+
+/**
  * Stub auth — single demo user from env. Real multi-user / multi-tenant auth
  * means swapping this for `@teamsuzie/shared-auth` (Postgres-backed users,
  * Redis-backed sessions, CSRF). The route shape (POST /api/auth/login,
