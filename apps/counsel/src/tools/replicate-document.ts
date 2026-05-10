@@ -1,5 +1,5 @@
 import type { AnyToolDefinition } from '@teamsuzie/agent-loop';
-import type { DocumentVersionsStore } from '@teamsuzie/document-versions';
+import type { DocumentVersionsStore } from '@counsel/document-versions';
 import type { FileRecord, InMemoryFileStore } from '../files.js';
 
 interface BuildOptions {
@@ -77,7 +77,7 @@ export function buildReplicateDocumentTools(
       let versionId: string | undefined;
       if (documentVersions) {
         try {
-          const v = documentVersions.addVersion({
+          const v = await documentVersions.addVersion({
             externalDocId: newFileId,
             parentId: null,
             source: 'upload',

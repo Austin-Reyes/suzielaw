@@ -5,7 +5,7 @@ import {
   loadDocx,
   type ContentKeyedEdit,
 } from '@teamsuzie/docx';
-import type { DocumentVersionsStore } from '@teamsuzie/document-versions';
+import type { DocumentVersionsStore } from '@counsel/document-versions';
 import type { FileRecord, InMemoryFileStore } from '../files.js';
 import { findEditParagraphIndex } from '../redline-view.js';
 
@@ -208,8 +208,8 @@ export function buildProposeEditsTools(
       let versionId: string | undefined;
       if (documentVersions && appliedCount > 0) {
         try {
-          const head = documentVersions.getHead(args.file_id);
-          const v = documentVersions.addVersion({
+          const head = await documentVersions.getHead(args.file_id);
+          const v = await documentVersions.addVersion({
             externalDocId: args.file_id,
             parentId: head?.id ?? null,
             source: 'proposal',

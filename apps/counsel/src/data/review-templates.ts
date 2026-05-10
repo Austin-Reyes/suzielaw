@@ -1,4 +1,4 @@
-import type { UpsertSystemWorkflowInput } from '@teamsuzie/workflows';
+import type { UpsertSystemWorkflowInput } from '@counsel/workflows';
 
 /**
  * System workflows that double as review templates. Each entry has a

@@ -13,6 +13,10 @@ RUN pnpm install --frozen-lockfile=false && pnpm --filter "./packages/*" build
 
 WORKDIR /repo/app
 RUN pnpm install --frozen-lockfile=false
+# Build the @counsel/* workspace packages first so the app can resolve
+# their compiled types + entrypoints. Without this step `tsc` in the app
+# fails with "Cannot find module '@counsel/db'" etc.
+RUN pnpm --filter "./packages/*" build
 RUN pnpm --filter @counsel/assistant-client exec vite build
 RUN pnpm --filter @counsel/assistant build
 

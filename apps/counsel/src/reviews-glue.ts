@@ -7,7 +7,7 @@ import {
   type LlmStream,
   type RunCellAdapter,
 } from '@teamsuzie/grid-review';
-import type { KbSearchHit } from '@teamsuzie/kb';
+import type { KbSearchHit } from '@counsel/kb';
 import type { Request } from 'express';
 
 import type { CellChatMessage } from '@teamsuzie/grid-review';
@@ -94,7 +94,7 @@ export function buildReviewRunAdapter(
     // doc isn't indexed).
     let prepared: PreparedDocument;
     try {
-      if (opts.rag.hasIndex(workspaceId, document.externalDocId)) {
+      if (await opts.rag.hasIndex(workspaceId, document.externalDocId)) {
         // HyDE: rewrite the column prompt as a hypothetical answer
         // before embedding. Question embeddings ("what is the
         // governing law?") tend to land in a different region of the

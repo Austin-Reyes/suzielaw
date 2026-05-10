@@ -1,4 +1,4 @@
-import type { UpsertSystemWorkflowInput } from '@teamsuzie/workflows';
+import type { UpsertSystemWorkflowInput } from '@counsel/workflows';
 
 /**
  * System workflows that produce a structured Word deliverable via the

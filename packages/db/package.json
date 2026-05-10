@@ -1,0 +1,51 @@
+{
+  "name": "@counsel/db",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Postgres data layer for rbl Counsel — pg + Kysely + node-pg-migrate, AAD-aware pool, schema-isolated to counsel.*",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./request-context": {
+      "import": "./dist/requestContext.js",
+      "types": "./dist/requestContext.d.ts"
+    },
+    "./pool": {
+      "import": "./dist/pool.js",
+      "types": "./dist/pool.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "migrations"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "migrate:up": "tsx bin/migrate.ts up",
+    "migrate:down": "tsx bin/migrate.ts down"
+  },
+  "dependencies": {
+    "@azure/identity": "^4.5.0",
+    "kysely": "^0.27.4",
+    "node-pg-migrate": "^7.6.1",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/pg": "^8.11.10",
+    "dotenv": "^16.4.7",
+    "testcontainers": "^10.13.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}

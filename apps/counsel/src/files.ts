@@ -1,5 +1,5 @@
 import { citationProtocolFragment } from '@teamsuzie/citations';
-import type { WorkspacesStore } from '@teamsuzie/workspaces';
+import type { WorkspacesStore } from '@counsel/workspaces';
 import type { MatterRag } from './matter-rag.js';
 import { Router, json as expressJson, type Request, type Response } from 'express';
 import multer from 'multer';
@@ -417,7 +417,7 @@ export interface MatterUploadsRouterOptions {
   /** Optional: if set, every uploaded matter doc records a `source: 'upload'`
    *  version in the document-version chain so later proposals can branch
    *  from a known root version. */
-  documentVersions?: import('@teamsuzie/document-versions').DocumentVersionsStore;
+  documentVersions?: import('@counsel/document-versions').DocumentVersionsStore;
 }
 
 /**
@@ -449,7 +449,7 @@ export function createMatterUploadsRouter({
     upload.single('file'),
     async (req, res) => {
       const matterId = String(req.params.matterId ?? '');
-      if (!workspaces.getWorkspace(matterId)) {
+      if (!(await workspaces.getWorkspace(matterId))) {
         res.status(404).json({ error: 'matter not found' });
         return;
       }
@@ -481,7 +481,7 @@ export function createMatterUploadsRouter({
       };
       fileStore.put(record);
 
-      const doc = workspaces.addDocument({
+      const doc = await workspaces.addDocument({
         workspaceId: matterId,
         folderId,
         externalDocId: fileId,
@@ -495,7 +495,7 @@ export function createMatterUploadsRouter({
       // proposal/accept/reject points back at this via parent_id.
       if (documentVersions) {
         try {
-          documentVersions.addVersion({
+          await documentVersions.addVersion({
             externalDocId: fileId,
             source: 'upload',
             storageId: fileId,

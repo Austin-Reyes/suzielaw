@@ -14,7 +14,7 @@ export interface SessionUser {
  * Easy Auth (the platform-level auth in front of the Container App) injects
  * these headers AFTER it has validated the upstream OAuth token, so we can
  * trust them WITHOUT re-validating — but ONLY when we know we're running
- * behind Easy Auth (i.e., env var SUZIELAW_TRUST_EASY_AUTH=true).
+ * behind Easy Auth (i.e., env var COUNSEL_TRUST_EASY_AUTH=true).
  *
  * If those headers are present and no session user exists yet, we
  * auto-populate the session so the client sees an authenticated user and
@@ -59,7 +59,7 @@ function readEasyAuthIdentity(req: Request): SessionUser | null {
  * Middleware: if Easy Auth headers are present and the cookie session has no
  * user yet, populate it from Easy Auth. This makes Easy Auth the source of
  * truth in production and the cookie-session a passive cache. The demo
- * email/password flow remains intact for local dev (when SUZIELAW_TRUST_EASY_AUTH
+ * email/password flow remains intact for local dev (when COUNSEL_TRUST_EASY_AUTH
  * is off).
  */
 export function easyAuthBridgeMiddleware(opts?: { budget?: TokenBudgetStore }): RequestHandler {

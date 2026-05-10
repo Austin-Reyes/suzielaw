@@ -1,4 +1,4 @@
-import type { CellFormat } from '@teamsuzie/grid-review';
+import type { CellFormat } from '@counsel/grid-review';
 
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant';

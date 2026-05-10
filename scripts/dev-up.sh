@@ -45,6 +45,63 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# --- postgres (Docker, pgvector/pgvector:pg16, port 5432) ---
+# The @counsel/* stack needs Postgres + pgvector. Spin a single
+# container named `counsel-pg` and reuse it across runs.
+PG_CONTAINER="counsel-pg"
+PG_IMAGE="pgvector/pgvector:pg16"
+PG_PORT=5432
+PG_DB=counsel
+PG_USER=postgres
+PG_PASSWORD=postgres
+
+if ! command -v docker >/dev/null 2>&1; then
+  err "docker not found — install Docker Desktop or set PGHOST/etc. in apps/counsel/.env to point at an external Postgres."
+  exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+  err "docker daemon not running — open Docker Desktop and retry."
+  exit 1
+fi
+
+if docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER"; then
+  log "postgres ($PG_CONTAINER) already running"
+elif docker ps -a --format '{{.Names}}' | grep -qx "$PG_CONTAINER"; then
+  log "starting existing postgres container ($PG_CONTAINER)"
+  docker start "$PG_CONTAINER" >/dev/null
+else
+  log "creating postgres container ($PG_CONTAINER, $PG_IMAGE)"
+  docker run -d --name "$PG_CONTAINER" \
+    -p "$PG_PORT:5432" \
+    -e POSTGRES_PASSWORD="$PG_PASSWORD" \
+    -e POSTGRES_DB="$PG_DB" \
+    "$PG_IMAGE" >/dev/null
+fi
+
+log "waiting for postgres to accept connections…"
+for i in $(seq 1 60); do
+  if docker exec "$PG_CONTAINER" pg_isready -U "$PG_USER" -d "$PG_DB" >/dev/null 2>&1; then
+    log "postgres ready (localhost:$PG_PORT, db=$PG_DB)"
+    break
+  fi
+  sleep 1
+  if [ "$i" -eq 60 ]; then
+    err "postgres didn't accept connections within 60s. docker logs $PG_CONTAINER:"
+    docker logs --tail 30 "$PG_CONTAINER" >&2 || true
+    exit 1
+  fi
+done
+
+# Defaults for the counsel API process. Anything already set in the
+# environment (or apps/counsel/.env via dotenv/config) wins, so
+# overriding for a remote PG instance still works.
+export PGHOST="${PGHOST:-localhost}"
+export PGPORT="${PGPORT:-$PG_PORT}"
+export PGUSER="${PGUSER:-$PG_USER}"
+export PGPASSWORD="${PGPASSWORD:-$PG_PASSWORD}"
+export PGDATABASE="${PGDATABASE:-$PG_DB}"
+export PGSSLMODE="${PGSSLMODE:-disable}"
+
 # --- markitdown-agent (Python, port 3013) ---
 log "starting markitdown-agent (logs: $LOG_DIR/markitdown-agent.log)"
 # setsid puts the child in its own process group so we can SIGTERM the group

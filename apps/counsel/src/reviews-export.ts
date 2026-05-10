@@ -1,7 +1,7 @@
 import ExcelJS from 'exceljs';
 
-import type { ReviewsStore, ReviewSnapshot } from '@teamsuzie/grid-review';
-import type { WorkspacesStore } from '@teamsuzie/workspaces';
+import type { ReviewsStore, ReviewSnapshot } from '@counsel/grid-review';
+import type { WorkspacesStore } from '@counsel/workspaces';
 
 interface CellCitation {
   id: number;
@@ -35,11 +35,11 @@ export async function buildReviewWorkbook(
   fileName: string;
   reviewName: string;
 }> {
-  const snapshot = opts.reviews.getReviewSnapshot(opts.reviewId);
+  const snapshot = await opts.reviews.getReviewSnapshot(opts.reviewId);
   if (!snapshot || snapshot.review.workspaceId !== opts.matterId) {
     throw new Error('review not found');
   }
-  const workspace = opts.workspaces.getWorkspace(opts.matterId);
+  const workspace = await opts.workspaces.getWorkspace(opts.matterId);
 
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'RBL Counsel Assist';
@@ -116,15 +116,10 @@ function formatCellComment(
   cell: ReviewSnapshot['cells'][number],
   snapshot: ReviewSnapshot,
 ): string | null {
-  if (!cell.citations) return null;
-  let parsed: CellCitation[];
-  try {
-    const raw = JSON.parse(cell.citations);
-    if (!Array.isArray(raw)) return null;
-    parsed = raw as CellCitation[];
-  } catch {
-    return null;
-  }
+  // @counsel/grid-review surfaces citations as the parsed jsonb array
+  // directly (upstream returned the raw JSON string and we re-parsed).
+  if (!cell.citations || !Array.isArray(cell.citations)) return null;
+  const parsed = cell.citations as CellCitation[];
   if (parsed.length === 0) return null;
   const docNameByHandle = new Map(
     snapshot.documents.map((d) => [d.externalDocId, d.name]),

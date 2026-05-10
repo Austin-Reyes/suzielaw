@@ -1,4 +1,4 @@
-import type { Workflow } from '@teamsuzie/workflows';
+import type { Workflow } from '@counsel/workflows';
 
 interface NamedTool {
   name: string;

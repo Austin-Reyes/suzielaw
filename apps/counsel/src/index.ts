@@ -50,12 +50,9 @@ import { buildGenerateDocxTools } from './tools/generate-docx.js';
 import { applyWorkflowOverrides } from './workflow-overrides.js';
 import { buildTemplateTools } from './tools/templates.js';
 import { applyPersona, createPersonasRouter, PersonaRegistry } from '@teamsuzie/personas';
-import { createKbSearchTool } from '@teamsuzie/kb';
-import { createModelSettingsRouter, ModelSettingsStore } from '@teamsuzie/model-settings';
+import { validateLocalAgentUrl } from '@teamsuzie/agent-loop';
 import { CLOUD_PROVIDERS, CLOUD_PROVIDER_IDS, providerForModel, wireModelIdFor } from './cloud-providers.js';
-import { createWorkspacesRouter, WorkspacesStore } from '@teamsuzie/workspaces';
-import { DocumentVersionsStore } from '@teamsuzie/document-versions';
-import { MembersStore } from '@teamsuzie/sharing';
+import type { Workspace, WorkspaceDocument } from '@counsel/workspaces';
 import {
   backfillMatterOwnership,
   createMatterMembersRouter,
@@ -64,15 +61,19 @@ import {
   listVisibleWorkflowsForUser,
   resolveWorkflowRole,
 } from './sharing.js';
-import { createReviewsRouter, ReviewsStore } from '@teamsuzie/grid-review';
+import type { CellFormat, ReviewColumn, ReviewDocument } from '@counsel/grid-review';
+import type { RunCellAdapter } from '@teamsuzie/grid-review';
 import { buildReviewRunAdapter } from './reviews-glue.js';
-import { ChatsStore, createChatsRouter } from '@teamsuzie/chats';
-import { WorkflowsStore, createWorkflowsRouter } from '@teamsuzie/workflows';
+import type { Chat } from '@counsel/chats';
+import type { WorkflowColumnConfig, WorkflowOutputMode } from '@counsel/workflows';
+import { WORKFLOW_OUTPUT_MODES } from '@counsel/workflows';
 import { seedAndMigrateWorkflows } from './seed-workflows.js';
 import { parseResponse } from '@teamsuzie/citations';
 import type { FileRecord } from './files.js';
-import { MatterRag } from './matter-rag.js';
-import { buildKbStore, createKbRouter } from './kb.js';
+import { MatterRag, type MatterDocIndexDB } from './matter-rag.js';
+import type { Kysely as KyselyType } from 'kysely';
+import { createKbRouter, createKbSearchTool } from './kb.js';
+import { bootstrapCounselDb } from './pg-db.js';
 import { draftColumnPrompt } from './column-draft.js';
 import { buildReviewWorkbook } from './reviews-export.js';
 import { runDocumentDiff } from './diff-engine.js';
@@ -84,6 +85,12 @@ import { db } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const clientDistDir = path.resolve(__dirname, '../client/dist');
+
+// @counsel/* Postgres handle. Top-level await: tsconfig is ESM + NodeNext,
+// so the runtime + tsx both resolve this without ceremony. bootstrapCounselDb()
+// runs migrations, constructs every @counsel store, and caches the result —
+// it's the single gate for every postgres-backed surface in this file.
+const counselDb = await bootstrapCounselDb();
 
 const approvals = new ApprovalQueue({ store: new InMemoryApprovalStore() });
 const fileStore = new InMemoryFileStore();
@@ -120,25 +127,26 @@ if (personaRegistry.listBuiltins().length > 0) {
 }
 
 // Per-user model-endpoint overrides (the editable config behind each Local row).
-const modelSettings = new ModelSettingsStore({ db, envRegistry: config.modelAgents });
+const modelSettings = counselDb.stores.modelSettings;
 
-// Workspaces (legal apps surface them as "Matters") — schema lives upstream;
-// the suzielaw API mounts this at /api/matters to match the UI label.
-const workspaces = new WorkspacesStore({ db });
+// Workspaces (legal apps surface them as "Matters") — backed by
+// @counsel/workspaces. The /api/matters surface is inlined below
+// (replaces upstream createWorkspacesRouter, whose signature is sync).
+const workspaces = counselDb.stores.workspaces;
 
 // Document version chains. Every matter-doc upload records a
 // `source: 'upload'` version; chat-driven proposals branch from that
 // with `source: 'proposal'`. No HTTP surface yet — host code reads it
 // via the store directly.
-const documentVersions = new DocumentVersionsStore({ db });
+const documentVersions = counselDb.stores.documentVersions;
 
 // Cross-subject membership store. Ownership of matters is encoded as
 // an owner-role member row added at matter-creation time (see the POST
 // /api/matters shadow below). Existing pre-membership matters are
 // backfilled to the demo user at boot — single-user demo bridge.
-const members = new MembersStore({ db });
+const members = counselDb.stores.members;
 {
-  const { granted } = backfillMatterOwnership({
+  const { granted } = await backfillMatterOwnership({
     members,
     workspaces,
     ownerEmail: config.demo.email,
@@ -149,31 +157,624 @@ const members = new MembersStore({ db });
 }
 const requireMatterAccess = createRequireMatterAccess({ members, workspaces });
 
-// Tabular reviews. Mounted under /api/matters/:matterId/reviews.
-const reviews = new ReviewsStore({ db });
+// Tabular reviews. Mounted under /api/matters/:matterId/reviews via the
+// inline async router below (replaces upstream createReviewsRouter).
+const reviews = counselDb.stores.reviews;
 {
-  const recovered = reviews.recoverStaleStreaming();
+  const recovered = await reviews.recoverStaleStreaming();
   if (recovered > 0) {
     console.log(`Reviews: reset ${recovered} stale streaming cell(s) to pending after restart.`);
   }
 }
 
-// Persisted matter-scoped chats. Mounted under /api/matters/:matterId/chats.
-const chats = new ChatsStore({ db });
+// Persisted matter/review/assistant chats — backed by @counsel/chats. The
+// `workspace_id` column is opaque, so the same store/table backs all three
+// surfaces by namespace prefix (`<matterId>`, `review:<id>`, `assistant:<email>`).
+const chats = counselDb.stores.chats;
+
+/**
+ * Inline async router factory mirroring the upstream `createChatsRouter`
+ * shape from `@teamsuzie/chats`. Mounts the standard chat CRUD endpoints
+ * against `chats` (the @counsel/chats store) under whatever prefix the
+ * caller chooses, scoping ownership to a `getWorkspaceId(req)` callback.
+ */
+function createCounselChatsRouter(
+  getWorkspaceId: (req: express.Request) => string,
+): express.Router {
+  const router: express.Router = express.Router();
+
+  router.get('/', async (req, res) => {
+    res.json({ items: await chats.listChats(getWorkspaceId(req)) });
+  });
+
+  router.post('/', async (req, res) => {
+    const workspaceId = getWorkspaceId(req);
+    const body = req.body as Record<string, unknown> | undefined;
+    const name = typeof body?.name === 'string' ? body.name.trim() : undefined;
+    let personaId: string | null | undefined;
+    if (body && 'personaId' in body) {
+      const raw = body.personaId;
+      personaId = typeof raw === 'string' && raw.length > 0 ? raw : null;
+    }
+    const chat = await chats.createChat({ workspaceId, name, personaId });
+    res.status(201).json({ item: chat });
+  });
+
+  router.get('/:chatId', async (req, res) => {
+    const chatId = String(req.params.chatId ?? '');
+    const chat = await chats.getChat(chatId);
+    if (!chat || chat.workspaceId !== getWorkspaceId(req)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    res.json({ item: chat });
+  });
+
+  router.get('/:chatId/messages', async (req, res) => {
+    const chatId = String(req.params.chatId ?? '');
+    const chat = await chats.getChat(chatId);
+    if (!chat || chat.workspaceId !== getWorkspaceId(req)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    res.json({ items: await chats.listMessages(chatId) });
+  });
+
+  router.patch('/:chatId', async (req, res) => {
+    const chatId = String(req.params.chatId ?? '');
+    const chat = await chats.getChat(chatId);
+    if (!chat || chat.workspaceId !== getWorkspaceId(req)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const body = req.body as Record<string, unknown> | undefined;
+    const patch: { name?: string; personaId?: string | null } = {};
+    if (typeof body?.name === 'string') {
+      const trimmed = body.name.trim();
+      if (!trimmed) {
+        res.status(400).json({ error: 'name cannot be empty' });
+        return;
+      }
+      patch.name = trimmed;
+    }
+    if (body && 'personaId' in body) {
+      const raw = body.personaId;
+      patch.personaId = typeof raw === 'string' && raw.length > 0 ? raw : null;
+    }
+    const updated = await chats.updateChat(chatId, patch);
+    res.json({ item: updated });
+  });
+
+  router.delete('/:chatId/messages', async (req, res) => {
+    const chatId = String(req.params.chatId ?? '');
+    const chat = await chats.getChat(chatId);
+    if (!chat || chat.workspaceId !== getWorkspaceId(req)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const removed = await chats.clearMessages(chatId);
+    res.json({ ok: true, removed });
+  });
+
+  router.delete('/:chatId', async (req, res) => {
+    const chatId = String(req.params.chatId ?? '');
+    const chat = await chats.getChat(chatId);
+    if (!chat || chat.workspaceId !== getWorkspaceId(req)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    await chats.deleteChat(chatId);
+    res.json({ ok: true });
+  });
+
+  return router;
+}
+
+const VALID_REVIEW_FORMATS: ReadonlyArray<CellFormat> = [
+  'text',
+  'short_text',
+  'date',
+  'yes_no',
+  'bullets',
+  'money',
+];
+
+/**
+ * Inline async router factory mirroring upstream `createReviewsRouter`,
+ * scoped to the @counsel/grid-review store. Mounts CRUD + the SSE
+ * cell/run + review/run streaming endpoints. The runner side
+ * (`runCellWithFormat`, `LlmStream`, etc.) stays on @teamsuzie — the
+ * runAdapter abstracts that so this factory only deals with persistence
+ * + streaming framing.
+ */
+function createCounselReviewsRouter(
+  getWorkspaceId: (req: express.Request) => string,
+  runAdapter: RunCellAdapter | undefined,
+): express.Router {
+  const router: express.Router = express.Router();
+
+  router.get('/', async (req, res) => {
+    const workspaceId = getWorkspaceId(req);
+    res.json({ items: await reviews.listReviews(workspaceId) });
+  });
+
+  router.post('/', async (req, res) => {
+    const workspaceId = getWorkspaceId(req);
+    const body = req.body as Record<string, unknown> | undefined;
+    const name = String(body?.name || '').trim();
+    if (!name) {
+      res.status(400).json({ error: 'name is required' });
+      return;
+    }
+    const description =
+      typeof body?.description === 'string' && body.description.trim().length > 0
+        ? body.description.trim()
+        : null;
+    const review = await reviews.createReview({ workspaceId, name, description });
+    res.status(201).json({ item: review });
+  });
+
+  router.get('/:reviewId', async (req, res) => {
+    const reviewId = String(req.params.reviewId ?? '');
+    const snap = await reviews.getReviewSnapshot(reviewId);
+    if (!snap || snap.review.workspaceId !== getWorkspaceId(req)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    res.json({ snapshot: snap });
+  });
+
+  router.patch('/:reviewId', async (req, res) => {
+    const reviewId = String(req.params.reviewId ?? '');
+    const review = await reviews.getReview(reviewId);
+    if (!review || review.workspaceId !== getWorkspaceId(req)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const body = req.body as Record<string, unknown> | undefined;
+    const patch: { name?: string; description?: string | null } = {};
+    if (typeof body?.name === 'string') {
+      const trimmed = body.name.trim();
+      if (!trimmed) {
+        res.status(400).json({ error: 'name cannot be empty' });
+        return;
+      }
+      patch.name = trimmed;
+    }
+    if (body && 'description' in body) {
+      const d = body.description;
+      if (d === null) patch.description = null;
+      else if (typeof d === 'string') {
+        const trimmed = d.trim();
+        patch.description = trimmed.length > 0 ? trimmed : null;
+      } else {
+        res.status(400).json({ error: 'description must be a string or null' });
+        return;
+      }
+    }
+    const updated = await reviews.updateReview(reviewId, patch);
+    res.json({ item: updated });
+  });
+
+  router.delete('/:reviewId', async (req, res) => {
+    const reviewId = String(req.params.reviewId ?? '');
+    const review = await reviews.getReview(reviewId);
+    if (!review || review.workspaceId !== getWorkspaceId(req)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    await reviews.deleteReview(reviewId);
+    res.json({ ok: true });
+  });
+
+  router.post('/:reviewId/columns', async (req, res) => {
+    const reviewId = String(req.params.reviewId ?? '');
+    const review = await reviews.getReview(reviewId);
+    if (!review || review.workspaceId !== getWorkspaceId(req)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const body = req.body as Record<string, unknown> | undefined;
+    const title = String(body?.title || '').trim();
+    const prompt = String(body?.prompt || '').trim();
+    if (!title || !prompt) {
+      res.status(400).json({ error: 'title and prompt are required' });
+      return;
+    }
+    let format: CellFormat = 'text';
+    if (typeof body?.format === 'string') {
+      if (!VALID_REVIEW_FORMATS.includes(body.format as CellFormat)) {
+        res.status(400).json({ error: 'unknown format' });
+        return;
+      }
+      format = body.format as CellFormat;
+    }
+    const position =
+      typeof body?.position === 'number' && Number.isInteger(body.position)
+        ? body.position
+        : (await reviews.listColumns(reviewId)).length;
+    const col = await reviews.addColumn({ reviewId, title, prompt, format, position });
+    res.status(201).json({ item: col });
+  });
+
+  router.patch('/:reviewId/columns/:colId', async (req, res) => {
+    const reviewId = String(req.params.reviewId ?? '');
+    const colId = String(req.params.colId ?? '');
+    const review = await reviews.getReview(reviewId);
+    const column = await reviews.getColumn(colId);
+    if (
+      !review ||
+      review.workspaceId !== getWorkspaceId(req) ||
+      !column ||
+      column.reviewId !== reviewId
+    ) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const body = req.body as Record<string, unknown> | undefined;
+    const patch: {
+      title?: string;
+      prompt?: string;
+      format?: CellFormat;
+      position?: number;
+    } = {};
+    if (typeof body?.title === 'string') {
+      const trimmed = body.title.trim();
+      if (!trimmed) {
+        res.status(400).json({ error: 'title cannot be empty' });
+        return;
+      }
+      patch.title = trimmed;
+    }
+    if (typeof body?.prompt === 'string') {
+      const trimmed = body.prompt.trim();
+      if (!trimmed) {
+        res.status(400).json({ error: 'prompt cannot be empty' });
+        return;
+      }
+      patch.prompt = trimmed;
+    }
+    if (typeof body?.format === 'string') {
+      if (!VALID_REVIEW_FORMATS.includes(body.format as CellFormat)) {
+        res.status(400).json({ error: 'unknown format' });
+        return;
+      }
+      patch.format = body.format as CellFormat;
+    }
+    if (typeof body?.position === 'number' && Number.isInteger(body.position)) {
+      patch.position = body.position;
+    }
+    const updated = await reviews.updateColumn(colId, patch);
+    res.json({ item: updated });
+  });
+
+  router.delete('/:reviewId/columns/:colId', async (req, res) => {
+    const reviewId = String(req.params.reviewId ?? '');
+    const colId = String(req.params.colId ?? '');
+    const review = await reviews.getReview(reviewId);
+    const column = await reviews.getColumn(colId);
+    if (
+      !review ||
+      review.workspaceId !== getWorkspaceId(req) ||
+      !column ||
+      column.reviewId !== reviewId
+    ) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    await reviews.removeColumn(colId);
+    res.json({ ok: true });
+  });
+
+  router.post('/:reviewId/documents', async (req, res) => {
+    const reviewId = String(req.params.reviewId ?? '');
+    const review = await reviews.getReview(reviewId);
+    if (!review || review.workspaceId !== getWorkspaceId(req)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const body = req.body as Record<string, unknown> | undefined;
+    const externalDocId = String(body?.externalDocId || '').trim();
+    const name = String(body?.name || '').trim();
+    if (!externalDocId || !name) {
+      res.status(400).json({ error: 'externalDocId and name are required' });
+      return;
+    }
+    const mimeType =
+      typeof body?.mimeType === 'string' && body.mimeType.length > 0
+        ? body.mimeType
+        : null;
+    const position =
+      typeof body?.position === 'number' && Number.isInteger(body.position)
+        ? body.position
+        : (await reviews.listDocuments(reviewId)).length;
+    try {
+      const row = await reviews.addDocument({
+        reviewId,
+        externalDocId,
+        name,
+        mimeType,
+        position,
+      });
+      res.status(201).json({ item: row });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'failed';
+      // The unique constraint on (review_id, external_doc_id) trips here.
+      // Postgres surfaces this as `23505 duplicate key`; sqlite/upstream
+      // surfaced it as a string match on `UNIQUE`. Match either.
+      if (/UNIQUE|duplicate key/i.test(message)) {
+        res.status(409).json({ error: 'document already in review' });
+        return;
+      }
+      res.status(500).json({ error: message });
+    }
+  });
+
+  router.delete('/:reviewId/documents/:rowId', async (req, res) => {
+    const reviewId = String(req.params.reviewId ?? '');
+    const rowId = String(req.params.rowId ?? '');
+    const review = await reviews.getReview(reviewId);
+    const row = await reviews.getDocument(rowId);
+    if (
+      !review ||
+      review.workspaceId !== getWorkspaceId(req) ||
+      !row ||
+      row.reviewId !== reviewId
+    ) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    await reviews.removeDocument(rowId);
+    res.json({ ok: true });
+  });
+
+  router.post('/:reviewId/cells/run', async (req, res) => {
+    if (!runAdapter) {
+      res.status(501).json({ error: 'run adapter not configured' });
+      return;
+    }
+    const reviewId = String(req.params.reviewId ?? '');
+    const review = await reviews.getReview(reviewId);
+    if (!review || review.workspaceId !== getWorkspaceId(req)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const body = req.body as Record<string, unknown> | undefined;
+    const columnId = String(body?.columnId ?? '');
+    const reviewDocumentId = String(body?.reviewDocumentId ?? '');
+    const column = await reviews.getColumn(columnId);
+    const document = await reviews.getDocument(reviewDocumentId);
+    if (!column || column.reviewId !== reviewId) {
+      res.status(404).json({ error: 'column not found' });
+      return;
+    }
+    if (!document || document.reviewId !== reviewId) {
+      res.status(404).json({ error: 'row not found' });
+      return;
+    }
+    await reviews.upsertCell({
+      reviewId,
+      columnId: column.id,
+      reviewDocumentId: document.id,
+      status: 'pending',
+      value: null,
+      citations: null,
+      error: null,
+    });
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+    const send = (event: object) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+    const abort = new AbortController();
+    res.on('close', () => {
+      if (!res.writableEnded) abort.abort();
+    });
+    try {
+      send({ type: 'start', columnId: column.id, rowId: document.id });
+      let accumulated = '';
+      let finalCell: Awaited<ReturnType<typeof reviews.upsertCell>> | null = null;
+      try {
+        for await (const event of runAdapter({
+          request: req,
+          workspaceId: review.workspaceId,
+          // @counsel types use Date for added_at/created_at; upstream
+          // RunCellAdapter expects number-typed timestamps. Adapter
+          // implementations only read string fields, so the shape mismatch
+          // is purely cosmetic — cast through unknown.
+          document: document as unknown as Parameters<RunCellAdapter>[0]['document'],
+          column: column as unknown as Parameters<RunCellAdapter>[0]['column'],
+          signal: abort.signal,
+        })) {
+          if (event.type === 'token') {
+            accumulated += event.text;
+            await reviews.upsertCell({
+              reviewId,
+              columnId: column.id,
+              reviewDocumentId: document.id,
+              status: 'streaming',
+              value: accumulated,
+            });
+            send({ type: 'cell_token', columnId: column.id, rowId: document.id, text: event.text });
+          } else if (event.type === 'retrieved') {
+            send({
+              type: 'cell_retrieved',
+              columnId: column.id,
+              rowId: document.id,
+              summary: event.summary,
+              chunkCount: event.chunkCount,
+              chunks: event.chunks,
+              retrievalQuery: event.retrievalQuery,
+            });
+          } else if (event.type === 'done') {
+            finalCell = await reviews.upsertCell({
+              reviewId,
+              columnId: column.id,
+              reviewDocumentId: document.id,
+              status: 'done',
+              value: event.text,
+              // @counsel/grid-review's jsonb column accepts arrays directly.
+              citations: event.citations as unknown as unknown[],
+              error: null,
+            });
+          } else if (event.type === 'error') {
+            finalCell = await reviews.upsertCell({
+              reviewId,
+              columnId: column.id,
+              reviewDocumentId: document.id,
+              status: 'error',
+              error: event.error.message,
+            });
+          }
+        }
+      } catch (err) {
+        finalCell = await reviews.upsertCell({
+          reviewId,
+          columnId: column.id,
+          reviewDocumentId: document.id,
+          status: 'error',
+          error: err instanceof Error ? err.message : 'failed',
+        });
+      }
+      send({
+        type: 'done',
+        columnId: column.id,
+        rowId: document.id,
+        cellId: finalCell?.id ?? null,
+        status: finalCell?.status ?? 'error',
+      });
+    } finally {
+      res.end();
+    }
+  });
+
+  router.post('/:reviewId/run', async (req, res) => {
+    if (!runAdapter) {
+      res.status(501).json({ error: 'run adapter not configured' });
+      return;
+    }
+    const reviewId = String(req.params.reviewId ?? '');
+    const review = await reviews.getReview(reviewId);
+    if (!review || review.workspaceId !== getWorkspaceId(req)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const columns = await reviews.listColumns(reviewId);
+    const docs = await reviews.listDocuments(reviewId);
+    const cells = await reviews.listCells(reviewId);
+    const cellByKey = new Map(cells.map((c) => [`${c.columnId}::${c.reviewDocumentId}`, c]));
+    const pending: { column: ReviewColumn; document: ReviewDocument }[] = [];
+    for (const doc of docs) {
+      for (const col of columns) {
+        const existing = cellByKey.get(`${col.id}::${doc.id}`);
+        if (!existing || existing.status === 'pending' || existing.status === 'error') {
+          pending.push({ column: col, document: doc });
+        }
+      }
+    }
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+    const send = (event: object) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+    const abort = new AbortController();
+    res.on('close', () => {
+      if (!res.writableEnded) abort.abort();
+    });
+    try {
+      send({ type: 'start', total: pending.length });
+      for (const { column, document } of pending) {
+        if (abort.signal.aborted) break;
+        send({ type: 'cell_start', columnId: column.id, rowId: document.id });
+        let accumulated = '';
+        let finalCell: Awaited<ReturnType<typeof reviews.upsertCell>> | null = null;
+        try {
+          for await (const event of runAdapter({
+            request: req,
+            workspaceId: review.workspaceId,
+            document: document as unknown as Parameters<RunCellAdapter>[0]['document'],
+            column: column as unknown as Parameters<RunCellAdapter>[0]['column'],
+            signal: abort.signal,
+          })) {
+            if (event.type === 'token') {
+              accumulated += event.text;
+              await reviews.upsertCell({
+                reviewId,
+                columnId: column.id,
+                reviewDocumentId: document.id,
+                status: 'streaming',
+                value: accumulated,
+              });
+              send({ type: 'cell_token', columnId: column.id, rowId: document.id, text: event.text });
+            } else if (event.type === 'retrieved') {
+              send({
+                type: 'cell_retrieved',
+                columnId: column.id,
+                rowId: document.id,
+                summary: event.summary,
+                chunkCount: event.chunkCount,
+                chunks: event.chunks,
+                retrievalQuery: event.retrievalQuery,
+              });
+            } else if (event.type === 'done') {
+              finalCell = await reviews.upsertCell({
+                reviewId,
+                columnId: column.id,
+                reviewDocumentId: document.id,
+                status: 'done',
+                value: event.text,
+                citations: event.citations as unknown as unknown[],
+                error: null,
+              });
+            } else if (event.type === 'error') {
+              finalCell = await reviews.upsertCell({
+                reviewId,
+                columnId: column.id,
+                reviewDocumentId: document.id,
+                status: 'error',
+                error: event.error.message,
+              });
+            }
+          }
+        } catch (err) {
+          finalCell = await reviews.upsertCell({
+            reviewId,
+            columnId: column.id,
+            reviewDocumentId: document.id,
+            status: 'error',
+            error: err instanceof Error ? err.message : 'failed',
+          });
+        }
+        send({
+          type: 'cell_done',
+          columnId: column.id,
+          rowId: document.id,
+          cellId: finalCell?.id ?? null,
+          status: finalCell?.status ?? 'error',
+        });
+      }
+      send({ type: 'done' });
+    } finally {
+      res.end();
+    }
+  });
+
+  return router;
+}
 
 // Workflows-as-data. System workflows seed at startup from code-defined
 // catalogs; user workflows are created via UI.
-const workflows = new WorkflowsStore({ db });
-seedAndMigrateWorkflows(workflows, db);
+const workflows = counselDb.stores.workflows;
+await seedAndMigrateWorkflows(workflows);
 
-// Knowledge base — sqlite-vec backed RAG. Always available now: matter
-// docs are indexed into it for cell runs (and later matter chats),
-// regardless of the user-facing KB feature flag. The flag below only
-// controls whether to expose the user-facing KB router + the
-// `vector_search` chat tool.
-const kbStore = buildKbStore();
+// Knowledge base — Postgres + pgvector via @counsel/kb. Always available
+// now: matter docs are indexed into it for cell runs (and later matter
+// chats), regardless of the user-facing KB feature flag. The flag below
+// only controls whether to expose the user-facing KB router + the
+// `kb_search` chat tool.
+const kbStore = counselDb.stores.kb;
 {
-  const stats = kbStore.count(null);
+  const stats = await kbStore.count(null);
   console.log(
     `Knowledge base store ready: ${stats.documents} document(s), ${stats.chunks} chunk(s); embeddings via ${config.kb.embeddingModel} (dim ${config.kb.embeddingDim}) at ${config.kb.embeddingBaseUrl}`,
   );
@@ -184,11 +785,44 @@ const kbSearchTool = config.kb.enabled
 
 // Per-matter RAG glue: indexes uploaded matter docs into kbStore (with
 // owner_id = matter:<matterId>) and exposes per-doc + per-matter search.
+//
+// The Kysely cast is the boundary between the broad app DB type (every
+// @counsel/* table union'd) and MatterRag's narrow `matter_doc_index`
+// view — Kysely's DB generic is invariant in TS, so the wider handle
+// has to be re-typed at the seam.
 const matterRag = new MatterRag({
-  db,
+  db: counselDb.kysely as unknown as KyselyType<MatterDocIndexDB>,
   kb: kbStore,
   markitdownBaseUrl: config.markitdown.baseUrl,
 });
+
+// Body-parsing helpers for the inline /api/workflows routes — same shape
+// as the upstream router used to validate, kept tight to one file.
+function parseWorkflowOutputMode(raw: unknown): WorkflowOutputMode | undefined {
+  if (typeof raw !== 'string') return undefined;
+  return WORKFLOW_OUTPUT_MODES.includes(raw as WorkflowOutputMode)
+    ? (raw as WorkflowOutputMode)
+    : undefined;
+}
+
+function parseWorkflowColumnConfig(
+  raw: unknown,
+): WorkflowColumnConfig[] | null | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null) return null;
+  if (!Array.isArray(raw)) return undefined;
+  const out: WorkflowColumnConfig[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const e = entry as Record<string, unknown>;
+    const title = typeof e.title === 'string' ? e.title.trim() : '';
+    const prompt = typeof e.prompt === 'string' ? e.prompt.trim() : '';
+    const format = typeof e.format === 'string' ? e.format.trim() : '';
+    if (!title || !prompt || !format) continue;
+    out.push({ title, prompt, format });
+  }
+  return out;
+}
 
 function activeTools(): AnyToolDefinition[] {
   const out: AnyToolDefinition[] = [...builtInTools, ...courtListenerTools, ...templateTools, ...mcp.tools];
@@ -266,7 +900,7 @@ app.use(cors({ origin: config.allowedOrigin, credentials: true }));
 app.use(express.json({ limit: '2mb' }));
 app.use(createSessionMiddleware());
 // Bridge Container Apps Easy Auth → cookie-session. No-op when
-// SUZIELAW_TRUST_EASY_AUTH is unset (local dev). Must run BEFORE requireAuth
+// COUNSEL_TRUST_EASY_AUTH is unset (local dev). Must run BEFORE requireAuth
 // is reachable so the auto-populated session is visible to it.
 app.use(easyAuthBridgeMiddleware({ budget: tokenBudget }));
 app.use(createCsrfMiddleware({ cookieName: 'suzielaw.csrf' }));
@@ -301,21 +935,117 @@ app.use(
     getOwnerId: (req) => getSessionUser(req)?.email,
   }),
 );
-app.use(
-  '/api/model-settings',
-  requireAuth,
-  createModelSettingsRouter({
-    store: modelSettings,
-    getOwnerId: (req) => getSessionUser(req)?.email,
-    providerIds: CLOUD_PROVIDER_IDS,
-  }),
-);
+// Inline /api/model-settings router (replaces upstream sync createModelSettingsRouter).
+{
+  const known = modelSettings.knownModelIds();
+  const knownProviders = new Set<string>(CLOUD_PROVIDER_IDS);
+
+  app.get('/api/model-settings/providers', requireAuth, async (req, res) => {
+    const ownerId = getSessionUser(req)?.email;
+    if (!ownerId) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    res.json({
+      providers: await modelSettings.publicProviderKeys(ownerId, CLOUD_PROVIDER_IDS),
+    });
+  });
+
+  app.put('/api/model-settings/providers/:providerId', requireAuth, async (req, res) => {
+    const ownerId = getSessionUser(req)?.email;
+    if (!ownerId) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    const providerId = String(req.params.providerId);
+    if (!knownProviders.has(providerId)) {
+      res.status(404).json({ error: 'unknown_provider' });
+      return;
+    }
+    const body = req.body as Record<string, unknown> | undefined;
+    const apiKey = typeof body?.apiKey === 'string' ? body.apiKey.trim() : '';
+    if (!apiKey) {
+      res.status(400).json({ error: 'apiKey is required' });
+      return;
+    }
+    await modelSettings.setProviderKey(ownerId, providerId, apiKey);
+    res.json({
+      providers: await modelSettings.publicProviderKeys(ownerId, CLOUD_PROVIDER_IDS),
+    });
+  });
+
+  app.delete('/api/model-settings/providers/:providerId', requireAuth, async (req, res) => {
+    const ownerId = getSessionUser(req)?.email;
+    if (!ownerId) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    const providerId = String(req.params.providerId);
+    if (!knownProviders.has(providerId)) {
+      res.status(404).json({ error: 'unknown_provider' });
+      return;
+    }
+    await modelSettings.clearProviderKey(ownerId, providerId);
+    res.json({
+      providers: await modelSettings.publicProviderKeys(ownerId, CLOUD_PROVIDER_IDS),
+    });
+  });
+
+  app.get('/api/model-settings', requireAuth, async (req, res) => {
+    const ownerId = getSessionUser(req)?.email;
+    if (!ownerId) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    res.json({ settings: await modelSettings.publicSettings(ownerId) });
+  });
+
+  app.put('/api/model-settings/:modelId', requireAuth, async (req, res) => {
+    const ownerId = getSessionUser(req)?.email;
+    if (!ownerId) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    const modelId = String(req.params.modelId);
+    if (!known.has(modelId)) {
+      res.status(404).json({ error: 'unknown_model' });
+      return;
+    }
+    const body = req.body as Record<string, unknown> | undefined;
+    const baseUrlInput = String(body?.baseUrl || '').trim();
+    const apiKeyInput = body?.apiKey;
+    const apiKey =
+      typeof apiKeyInput === 'string' && apiKeyInput.trim() ? apiKeyInput.trim() : null;
+    const validation = validateLocalAgentUrl(baseUrlInput);
+    if (!validation.ok || !validation.url) {
+      res.status(400).json({ error: validation.reason ?? 'invalid_url' });
+      return;
+    }
+    await modelSettings.setOverride(ownerId, modelId, validation.url, apiKey);
+    res.json({ settings: await modelSettings.publicSettings(ownerId) });
+  });
+
+  app.delete('/api/model-settings/:modelId', requireAuth, async (req, res) => {
+    const ownerId = getSessionUser(req)?.email;
+    if (!ownerId) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    const modelId = String(req.params.modelId);
+    if (!known.has(modelId)) {
+      res.status(404).json({ error: 'unknown_model' });
+      return;
+    }
+    await modelSettings.clearOverride(ownerId, modelId);
+    res.json({ settings: await modelSettings.publicSettings(ownerId) });
+  });
+}
 // Shadow POST /api/matters so we can grant the creator owner role in
 // the same call. The workspaces router's POST has no hook for this,
 // and we don't want to add one upstream until/unless multi-tenant
 // production needs it. Registered before the workspaces router so it
 // matches first.
-app.post('/api/matters', requireAuth, (req, res) => {
+app.post('/api/matters', requireAuth, async (req, res) => {
   const userId = getSessionUser(req)?.email;
   if (!userId) {
     res.status(401).json({ error: 'unauthenticated' });
@@ -330,11 +1060,11 @@ app.post('/api/matters', requireAuth, (req, res) => {
   const descriptionInput = body?.description;
   const description =
     typeof descriptionInput === 'string' ? descriptionInput.trim() : '';
-  const created = workspaces.createWorkspace({
+  const created = await workspaces.createWorkspace({
     name,
     description: description.length > 0 ? description : null,
   });
-  members.addMember({
+  await members.addMember({
     subjectType: 'matter',
     subjectId: created.id,
     userId,
@@ -344,22 +1074,21 @@ app.post('/api/matters', requireAuth, (req, res) => {
   res.status(201).json({ item: created });
 });
 
-// Shadow GET /api/matters to filter by membership. The workspaces
-// router still serves PATCH/archive/delete/etc.; those nested routes
-// run through the requireMatterAccess middleware mounted just below.
-app.get('/api/matters', requireAuth, (req, res) => {
+// Shadow GET /api/matters to filter by membership. The inline matter
+// routes below serve PATCH/archive/delete/folders/documents — those run
+// through the requireMatterAccess middleware mounted just below.
+app.get('/api/matters', requireAuth, async (req, res) => {
   const userId = getSessionUser(req)?.email;
   if (!userId) {
     res.status(401).json({ error: 'unauthenticated' });
     return;
   }
   const includeArchived = req.query.archived === 'true';
-  const accessible = workspaces
-    .listWorkspaces({ includeArchived })
-    .filter(
-      (w) =>
-        members.getRole({ type: 'matter', id: w.id }, userId) !== null,
-    );
+  const all = await workspaces.listWorkspaces({ includeArchived });
+  const roles = await Promise.all(
+    all.map((w) => members.getRole({ type: 'matter', id: w.id }, userId)),
+  );
+  const accessible = all.filter((_, i) => roles[i] !== null);
   res.json({ items: accessible });
 });
 
@@ -379,35 +1108,336 @@ app.use(
   createMatterMembersRouter({ members, workspaces }),
 );
 
-app.use(
-  '/api/matters',
-  requireAuth,
-  createWorkspacesRouter({
-    store: workspaces,
-    onDocumentRemoved: (workspace, doc) => {
-      // Cascade: KB index → file bytes → any review rows that pointed at
-      // this file. Without the last two steps, re-uploading the same file
-      // produces a new file_id and orphans the original — leaving stale
-      // review_documents rows whose lookups fall through to the legacy
-      // "Indexing not ready" full-doc path.
-      matterRag.removeFile(workspace.id, doc.externalDocId);
-      const filesRemoved = fileStore.delete(workspace.id, doc.externalDocId);
-      const reviewRowsRemoved = reviews.removeDocumentsByExternalId(
-        workspace.id,
-        doc.externalDocId,
-      );
-      if (filesRemoved || reviewRowsRemoved > 0) {
-        console.log(
-          `[matter] cleaned up ${doc.name}: ${filesRemoved ? 'file bytes,' : ''} ${reviewRowsRemoved} review row(s)`,
-        );
+// Inline /api/matters routes against @counsel/workspaces. Replaces the
+// upstream sync createWorkspacesRouter — store methods are now async and
+// the cleanup callbacks call async matterRag methods, so the whole
+// surface is async-aware. Mounted under the requireMatterAccess gate
+// above; no per-route auth needed.
+
+async function onMatterDocumentRemoved(
+  workspace: Workspace,
+  doc: WorkspaceDocument,
+): Promise<void> {
+  // Cascade: KB index → file bytes → review rows. Same logic the
+  // upstream onDocumentRemoved callback ran, plus we no longer need the
+  // upstream sync→async fire-and-forget bridge — every call below is
+  // properly awaited.
+  try {
+    await matterRag.removeFile(workspace.id, doc.externalDocId);
+  } catch (err) {
+    console.warn(
+      `[matter] matterRag.removeFile(${workspace.id}, ${doc.externalDocId}) rejected:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+  const filesRemoved = fileStore.delete(workspace.id, doc.externalDocId);
+  const reviewRowsRemoved = await reviews.removeDocumentsByExternalId(
+    workspace.id,
+    doc.externalDocId,
+  );
+  if (filesRemoved || reviewRowsRemoved > 0) {
+    console.log(
+      `[matter] cleaned up ${doc.name}: ${filesRemoved ? 'file bytes,' : ''} ${reviewRowsRemoved} review row(s)`,
+    );
+  }
+}
+
+async function onMatterRemoved(workspaceId: string): Promise<void> {
+  try {
+    await matterRag.removeMatter(workspaceId);
+  } catch (err) {
+    console.warn(
+      `[matter] matterRag.removeMatter(${workspaceId}) rejected:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+  await members.removeMembersFor({ type: 'matter', id: workspaceId });
+}
+
+async function wouldFolderMoveCreateCycle(
+  workspaceId: string,
+  folderId: string,
+  newParentId: string | null,
+): Promise<boolean> {
+  if (newParentId === null) return false;
+  if (newParentId === folderId) return true;
+  let cursor: string | null = newParentId;
+  const seen = new Set<string>();
+  while (cursor !== null && !seen.has(cursor)) {
+    if (cursor === folderId) return true;
+    seen.add(cursor);
+    const node = await workspaces.getFolder(cursor);
+    if (!node || node.workspaceId !== workspaceId) break;
+    cursor = node.parentFolderId ?? null;
+  }
+  return false;
+}
+
+app.get('/api/matters/:id', async (req, res) => {
+  const item = await workspaces.getWorkspace(req.params.id);
+  if (!item) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  res.json({ item });
+});
+
+app.patch('/api/matters/:id', async (req, res) => {
+  const body = req.body as Record<string, unknown> | undefined;
+  const patch: { name?: string; description?: string | null } = {};
+  if (typeof body?.name === 'string') {
+    const trimmed = body.name.trim();
+    if (!trimmed) {
+      res.status(400).json({ error: 'name cannot be empty' });
+      return;
+    }
+    patch.name = trimmed;
+  }
+  if (body && 'description' in body) {
+    const d = body.description;
+    if (d === null) {
+      patch.description = null;
+    } else if (typeof d === 'string') {
+      const trimmed = d.trim();
+      patch.description = trimmed.length > 0 ? trimmed : null;
+    } else {
+      res.status(400).json({ error: 'description must be a string or null' });
+      return;
+    }
+  }
+  const updated = await workspaces.updateWorkspace(req.params.id, patch);
+  if (!updated) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  res.json({ item: updated });
+});
+
+app.post('/api/matters/:id/archive', async (req, res) => {
+  if (!(await workspaces.getWorkspace(req.params.id))) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  await workspaces.archiveWorkspace(req.params.id);
+  res.json({ item: await workspaces.getWorkspace(req.params.id) });
+});
+
+app.post('/api/matters/:id/unarchive', async (req, res) => {
+  if (!(await workspaces.getWorkspace(req.params.id))) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  await workspaces.unarchiveWorkspace(req.params.id);
+  res.json({ item: await workspaces.getWorkspace(req.params.id) });
+});
+
+app.delete('/api/matters/:id', async (req, res) => {
+  const id = String(req.params.id ?? '');
+  const ok = await workspaces.deleteWorkspace(id);
+  if (!ok) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  await onMatterRemoved(id);
+  res.json({ ok: true });
+});
+
+app.get('/api/matters/:id/folders', async (req, res) => {
+  if (!(await workspaces.getWorkspace(req.params.id))) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  const parentRaw = req.query.parent;
+  let parent: string | null | undefined;
+  if (parentRaw === undefined) {
+    parent = undefined;
+  } else if (parentRaw === 'null' || parentRaw === '') {
+    parent = null;
+  } else if (typeof parentRaw === 'string') {
+    parent = parentRaw;
+  } else {
+    res.status(400).json({ error: 'parent must be a string' });
+    return;
+  }
+  res.json({ items: await workspaces.listFolders(req.params.id, parent) });
+});
+
+app.post('/api/matters/:id/folders', async (req, res) => {
+  if (!(await workspaces.getWorkspace(req.params.id))) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  const body = req.body as Record<string, unknown> | undefined;
+  const name = String(body?.name || '').trim();
+  if (!name) {
+    res.status(400).json({ error: 'name is required' });
+    return;
+  }
+  const parentRaw = body?.parentFolderId;
+  let parentFolderId: string | null = null;
+  if (typeof parentRaw === 'string' && parentRaw.length > 0) {
+    const parent = await workspaces.getFolder(parentRaw);
+    if (!parent || parent.workspaceId !== req.params.id) {
+      res.status(400).json({ error: 'parentFolderId does not belong to this workspace' });
+      return;
+    }
+    parentFolderId = parentRaw;
+  }
+  const created = await workspaces.createFolder({
+    workspaceId: req.params.id,
+    parentFolderId,
+    name,
+  });
+  res.status(201).json({ item: created });
+});
+
+app.get('/api/matters/:id/documents', async (req, res) => {
+  if (!(await workspaces.getWorkspace(req.params.id))) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  const folderRaw = req.query.folder;
+  let folderId: string | null | undefined;
+  if (folderRaw === undefined) {
+    folderId = undefined;
+  } else if (folderRaw === 'null' || folderRaw === '') {
+    folderId = null;
+  } else if (typeof folderRaw === 'string') {
+    folderId = folderRaw;
+  } else {
+    res.status(400).json({ error: 'folder must be a string' });
+    return;
+  }
+  res.json({ items: await workspaces.listDocuments(req.params.id, { folderId }) });
+});
+
+app.patch('/api/matters/:id/folders/:folderId', async (req, res) => {
+  const folder = await workspaces.getFolder(req.params.folderId);
+  if (!folder || folder.workspaceId !== req.params.id) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  const body = req.body as Record<string, unknown> | undefined;
+  const patch: { name?: string; parentFolderId?: string | null; position?: number } = {};
+  if (typeof body?.name === 'string') {
+    const trimmed = body.name.trim();
+    if (!trimmed) {
+      res.status(400).json({ error: 'name cannot be empty' });
+      return;
+    }
+    patch.name = trimmed;
+  }
+  if (body && 'parentFolderId' in body) {
+    const p = body.parentFolderId;
+    let parentFolderId: string | null;
+    if (p === null) {
+      parentFolderId = null;
+    } else if (typeof p === 'string') {
+      if (p.length === 0) {
+        parentFolderId = null;
+      } else {
+        const parent = await workspaces.getFolder(p);
+        if (!parent || parent.workspaceId !== req.params.id) {
+          res.status(400).json({
+            error: 'parentFolderId does not belong to this workspace',
+          });
+          return;
+        }
+        parentFolderId = p;
       }
-    },
-    onWorkspaceRemoved: (workspaceId) => {
-      matterRag.removeMatter(workspaceId);
-      members.removeMembersFor({ type: 'matter', id: workspaceId });
-    },
-  }),
-);
+    } else {
+      res.status(400).json({ error: 'parentFolderId must be a string or null' });
+      return;
+    }
+    if (await wouldFolderMoveCreateCycle(req.params.id, req.params.folderId, parentFolderId)) {
+      res.status(400).json({ error: 'parentFolderId would create a cycle' });
+      return;
+    }
+    patch.parentFolderId = parentFolderId;
+  }
+  if (typeof body?.position === 'number' && Number.isInteger(body.position)) {
+    patch.position = body.position;
+  }
+  const updated = await workspaces.updateFolder(req.params.folderId, patch);
+  if (!updated) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  res.json({ item: updated });
+});
+
+app.delete('/api/matters/:id/folders/:folderId', async (req, res) => {
+  const folder = await workspaces.getFolder(req.params.folderId);
+  if (!folder || folder.workspaceId !== req.params.id) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  await workspaces.deleteFolder(req.params.folderId);
+  res.json({ ok: true });
+});
+
+app.patch('/api/matters/:id/documents/:docId', async (req, res) => {
+  const doc = await workspaces.getDocument(req.params.docId);
+  if (!doc || doc.workspaceId !== req.params.id) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  const body = req.body as Record<string, unknown> | undefined;
+  const patch: { folderId?: string | null; name?: string; position?: number } = {};
+  if (body && 'folderId' in body) {
+    const f = body.folderId;
+    if (f === null) {
+      patch.folderId = null;
+    } else if (typeof f === 'string') {
+      if (f.length === 0) {
+        patch.folderId = null;
+      } else {
+        const folder = await workspaces.getFolder(f);
+        if (!folder || folder.workspaceId !== req.params.id) {
+          res.status(400).json({
+            error: 'folderId does not belong to this workspace',
+          });
+          return;
+        }
+        patch.folderId = f;
+      }
+    } else {
+      res.status(400).json({ error: 'folderId must be a string or null' });
+      return;
+    }
+  }
+  if (typeof body?.name === 'string') {
+    const trimmed = body.name.trim();
+    if (!trimmed) {
+      res.status(400).json({ error: 'name cannot be empty' });
+      return;
+    }
+    patch.name = trimmed;
+  }
+  if (typeof body?.position === 'number' && Number.isInteger(body.position)) {
+    patch.position = body.position;
+  }
+  const updated = await workspaces.updateDocument(req.params.docId, patch);
+  if (!updated) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  res.json({ item: updated });
+});
+
+app.delete('/api/matters/:id/documents/:docId', async (req, res) => {
+  const doc = await workspaces.getDocument(req.params.docId);
+  if (!doc || doc.workspaceId !== req.params.id) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  await workspaces.removeDocument(req.params.docId);
+  const workspace = await workspaces.getWorkspace(doc.workspaceId);
+  if (workspace) {
+    await onMatterDocumentRemoved(workspace, doc);
+  }
+  res.json({ ok: true });
+});
 app.use(
   '/api/matters',
   requireAuth,
@@ -447,11 +1477,9 @@ app.use(
     );
     next();
   },
-  createChatsRouter({
-    store: chats,
-    getWorkspaceId: (req) =>
-      (req as unknown as { _matterId?: string })._matterId ?? '',
-  }),
+  createCounselChatsRouter(
+    (req) => (req as unknown as { _matterId?: string })._matterId ?? '',
+  ),
 );
 // Workflows library. Visibility scopes by the session user — system
 // rows are shared, user rows are per-account, plus workflows shared
@@ -460,7 +1488,7 @@ app.use(
 // Custom GET / and GET /:id shadow the upstream router so explicitly-shared
 // workflows are visible. Mount the members router before the upstream router
 // so its routes match first.
-app.get('/api/workflows', requireAuth, (req, res) => {
+app.get('/api/workflows', requireAuth, async (req, res) => {
   const userId = getSessionUser(req)?.email;
   if (!userId) {
     res.status(401).json({ error: 'unauthenticated' });
@@ -468,7 +1496,7 @@ app.get('/api/workflows', requireAuth, (req, res) => {
   }
   const includeArchived = req.query.includeArchived === '1';
   res.json({
-    items: listVisibleWorkflowsForUser({
+    items: await listVisibleWorkflowsForUser({
       workflows,
       members,
       ownerId: userId,
@@ -476,14 +1504,56 @@ app.get('/api/workflows', requireAuth, (req, res) => {
     }),
   });
 });
-app.get('/api/workflows/:id', requireAuth, (req, res) => {
+app.get('/api/workflows/hidden', requireAuth, async (req, res) => {
+  const userId = getSessionUser(req)?.email;
+  if (!userId) {
+    res.status(401).json({ error: 'unauthenticated' });
+    return;
+  }
+  res.json({ items: await workflows.listHiddenIds(userId) });
+});
+app.post('/api/workflows', requireAuth, async (req, res) => {
+  const userId = getSessionUser(req)?.email;
+  if (!userId) {
+    res.status(401).json({ error: 'unauthenticated' });
+    return;
+  }
+  const body = req.body as Record<string, unknown> | undefined;
+  const name = String(body?.name || '').trim();
+  const prompt = String(body?.prompt || '').trim();
+  if (!name || !prompt) {
+    res.status(400).json({ error: 'name and prompt are required' });
+    return;
+  }
+  const description =
+    typeof body?.description === 'string' ? body.description.trim() : '';
+  const practiceAreas = Array.isArray(body?.practiceAreas)
+    ? (body.practiceAreas as unknown[])
+        .filter((x): x is string => typeof x === 'string')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  const columnConfig = parseWorkflowColumnConfig(body?.columnConfig);
+  const outputMode = parseWorkflowOutputMode(body?.outputMode);
+  const workflow = await workflows.createUserWorkflow({
+    ownerId: userId,
+    name,
+    description,
+    prompt,
+    practiceAreas,
+    columnConfig: columnConfig ?? null,
+    ...(outputMode ? { outputMode } : {}),
+  });
+  res.status(201).json({ item: workflow });
+});
+app.get('/api/workflows/:id', requireAuth, async (req, res) => {
   const userId = getSessionUser(req)?.email;
   if (!userId) {
     res.status(401).json({ error: 'unauthenticated' });
     return;
   }
   const id = String(req.params.id ?? '');
-  const role = resolveWorkflowRole({
+  const role = await resolveWorkflowRole({
     workflows,
     members,
     workflowId: id,
@@ -493,20 +1563,160 @@ app.get('/api/workflows/:id', requireAuth, (req, res) => {
     res.status(404).json({ error: 'not_found' });
     return;
   }
-  res.json({ item: workflows.get(id), role });
+  res.json({ item: await workflows.get(id), role });
+});
+app.patch('/api/workflows/:id', requireAuth, async (req, res) => {
+  const userId = getSessionUser(req)?.email;
+  if (!userId) {
+    res.status(401).json({ error: 'unauthenticated' });
+    return;
+  }
+  const id = String(req.params.id ?? '');
+  const body = req.body as Record<string, unknown> | undefined;
+  const patch: {
+    name?: string;
+    description?: string;
+    prompt?: string;
+    practiceAreas?: string[];
+    columnConfig?: WorkflowColumnConfig[] | null;
+    outputMode?: WorkflowOutputMode;
+  } = {};
+  if (typeof body?.name === 'string') {
+    const trimmed = body.name.trim();
+    if (!trimmed) {
+      res.status(400).json({ error: 'name cannot be empty' });
+      return;
+    }
+    patch.name = trimmed;
+  }
+  if (typeof body?.description === 'string') patch.description = body.description.trim();
+  if (typeof body?.prompt === 'string') {
+    const trimmed = body.prompt.trim();
+    if (!trimmed) {
+      res.status(400).json({ error: 'prompt cannot be empty' });
+      return;
+    }
+    patch.prompt = trimmed;
+  }
+  if (Array.isArray(body?.practiceAreas)) {
+    patch.practiceAreas = (body.practiceAreas as unknown[])
+      .filter((x): x is string => typeof x === 'string')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  if (body && Object.prototype.hasOwnProperty.call(body, 'columnConfig')) {
+    const parsed = parseWorkflowColumnConfig(body.columnConfig);
+    if (parsed !== undefined) patch.columnConfig = parsed;
+  }
+  const outputMode = parseWorkflowOutputMode(body?.outputMode);
+  if (outputMode) patch.outputMode = outputMode;
+  const updated = await workflows.updateUserWorkflow(id, userId, patch, userId);
+  if (!updated) {
+    res.status(404).json({ error: 'not_found_or_forbidden' });
+    return;
+  }
+  res.json({ item: updated });
+});
+app.get('/api/workflows/:id/versions', requireAuth, async (req, res) => {
+  const userId = getSessionUser(req)?.email;
+  if (!userId) {
+    res.status(401).json({ error: 'unauthenticated' });
+    return;
+  }
+  const id = String(req.params.id ?? '');
+  const existing = await workflows.get(id);
+  if (!existing) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  if (existing.source !== 'user' || existing.ownerId !== userId) {
+    res.status(404).json({ error: 'not_found_or_forbidden' });
+    return;
+  }
+  res.json({ items: await workflows.listVersions(id, userId) });
+});
+app.post('/api/workflows/:id/versions/:versionId/restore', requireAuth, async (req, res) => {
+  const userId = getSessionUser(req)?.email;
+  if (!userId) {
+    res.status(401).json({ error: 'unauthenticated' });
+    return;
+  }
+  const id = String(req.params.id ?? '');
+  const versionId = String(req.params.versionId ?? '');
+  const restored = await workflows.restoreVersion(id, versionId, userId, userId);
+  if (!restored) {
+    res.status(404).json({ error: 'not_found_or_forbidden' });
+    return;
+  }
+  res.json({ item: restored });
+});
+app.delete('/api/workflows/:id', requireAuth, async (req, res) => {
+  const userId = getSessionUser(req)?.email;
+  if (!userId) {
+    res.status(401).json({ error: 'unauthenticated' });
+    return;
+  }
+  const id = String(req.params.id ?? '');
+  const ok = await workflows.deleteUserWorkflow(id, userId);
+  if (!ok) {
+    res.status(404).json({ error: 'not_found_or_forbidden' });
+    return;
+  }
+  res.json({ ok: true });
+});
+app.post('/api/workflows/:id/archive', requireAuth, async (req, res) => {
+  const userId = getSessionUser(req)?.email;
+  if (!userId) {
+    res.status(401).json({ error: 'unauthenticated' });
+    return;
+  }
+  const ok = await workflows.archive(String(req.params.id ?? ''), userId);
+  if (!ok) {
+    res.status(404).json({ error: 'not_found_or_forbidden' });
+    return;
+  }
+  res.json({ ok: true });
+});
+app.post('/api/workflows/:id/unarchive', requireAuth, async (req, res) => {
+  const userId = getSessionUser(req)?.email;
+  if (!userId) {
+    res.status(401).json({ error: 'unauthenticated' });
+    return;
+  }
+  const ok = await workflows.unarchive(String(req.params.id ?? ''), userId);
+  if (!ok) {
+    res.status(404).json({ error: 'not_found_or_forbidden' });
+    return;
+  }
+  res.json({ ok: true });
+});
+app.post('/api/workflows/:id/hide', requireAuth, async (req, res) => {
+  const userId = getSessionUser(req)?.email;
+  if (!userId) {
+    res.status(401).json({ error: 'unauthenticated' });
+    return;
+  }
+  const id = String(req.params.id ?? '');
+  if (!(await workflows.get(id))) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  await workflows.hide(id, userId);
+  res.json({ ok: true });
+});
+app.post('/api/workflows/:id/unhide', requireAuth, async (req, res) => {
+  const userId = getSessionUser(req)?.email;
+  if (!userId) {
+    res.status(401).json({ error: 'unauthenticated' });
+    return;
+  }
+  await workflows.unhide(String(req.params.id ?? ''), userId);
+  res.json({ ok: true });
 });
 app.use(
   '/api/workflows/:workflowId/members',
   requireAuth,
   createWorkflowMembersRouter({ members, workflows }),
-);
-app.use(
-  '/api/workflows',
-  requireAuth,
-  createWorkflowsRouter({
-    store: workflows,
-    getOwnerId: (req) => getSessionUser(req)?.email,
-  }),
 );
 // Review-scoped chats live in the same chats table, namespaced by a
 // `review:<reviewId>` workspace_id prefix. The chats package treats the
@@ -523,11 +1733,10 @@ app.use(
       reviewId ? `review:${reviewId}` : '';
     next();
   },
-  createChatsRouter({
-    store: chats,
-    getWorkspaceId: (req) =>
+  createCounselChatsRouter(
+    (req) =>
       (req as unknown as { _reviewWorkspaceId?: string })._reviewWorkspaceId ?? '',
-  }),
+  ),
 );
 // Top-level Assistant chats — namespaced by an `assistant:<userEmail>` workspace_id
 // prefix. Same chats table; per-user scoping keeps each demo user's history
@@ -536,12 +1745,9 @@ app.use(
 app.use(
   '/api/assistant/chats',
   requireAuth,
-  createChatsRouter({
-    store: chats,
-    getWorkspaceId: (req) => {
-      const email = getSessionUser(req)?.email;
-      return email ? `assistant:${email}` : '';
-    },
+  createCounselChatsRouter((req) => {
+    const email = getSessionUser(req)?.email;
+    return email ? `assistant:${email}` : '';
   }),
 );
 app.use(
@@ -549,18 +1755,16 @@ app.use(
   requireAuth,
   (req, _res, next) => {
     // Express 5 doesn't merge parent params into a sub-router by default —
-    // stash matterId where the reviews router can find it.
+    // stash matterId where the inline routes can find it.
     (req as unknown as { _matterId?: string })._matterId = String(
       req.params.matterId ?? '',
     );
     next();
   },
-  createReviewsRouter({
-    store: reviews,
-    getWorkspaceId: (req) =>
-      (req as unknown as { _matterId?: string })._matterId ?? '',
-    runAdapter: reviewRunAdapter,
-  }),
+  createCounselReviewsRouter(
+    (req) => (req as unknown as { _matterId?: string })._matterId ?? '',
+    reviewRunAdapter,
+  ),
 );
 // Files are user content — gate behind auth before mounting the router.
 app.use('/api/files', requireAuth);
@@ -599,7 +1803,7 @@ app.get('/api/files/:sessionId/:fileId/redline-view', requireAuth, (req, res) =>
 app.post(
   '/api/files/:sessionId/:fileId/revisions/resolve',
   requireAuth,
-  (req, res) => {
+  async (req, res) => {
     const sessionId = String(req.params.sessionId ?? '');
     const fileId = String(req.params.fileId ?? '');
     const rec = fileStore.get(sessionId, fileId);
@@ -648,9 +1852,9 @@ app.post(
       // source's current head. Source label captures the operation.
       let versionId: string | undefined;
       try {
-        const head = documentVersions.getHead(fileId);
+        const head = await documentVersions.getHead(fileId);
         const source = accept.length > 0 ? 'accept' : 'reject';
-        const v = documentVersions.addVersion({
+        const v = await documentVersions.addVersion({
           externalDocId: fileId,
           parentId: head?.id ?? null,
           source,
@@ -743,7 +1947,7 @@ app.get('/api/health', async (_req, res) => {
       mcp: mcp.status,
       allowedHttpHosts: toolCtx.allowedHttpHosts ?? [],
       kb: config.kb.enabled
-        ? { enabled: true, ...kbStore.count(null) }
+        ? { enabled: true, ...(await kbStore.count(null)) }
         : { enabled: false },
       modelAgents: Object.fromEntries(
         Object.entries(config.modelAgents).map(([id, t]) => [id, { baseUrl: t.baseUrl }]),
@@ -779,7 +1983,7 @@ app.get('/api/health', async (_req, res) => {
       mcp: mcp.status,
       allowedHttpHosts: toolCtx.allowedHttpHosts ?? [],
       kb: config.kb.enabled
-        ? { enabled: true, ...kbStore.count(null) }
+        ? { enabled: true, ...(await kbStore.count(null)) }
         : { enabled: false },
       modelAgents: Object.fromEntries(
         Object.entries(config.modelAgents).map(([id, t]) => [id, { baseUrl: t.baseUrl }]),
@@ -828,7 +2032,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     const hasUserKey = !!(
       provider &&
       sessionEmailEarly &&
-      modelSettings.getProviderKey(sessionEmailEarly, provider.id)
+      (await modelSettings.getProviderKey(sessionEmailEarly, provider.id))
     );
     if (!provider || !hasUserKey) {
       res.status(400).json({
@@ -860,7 +2064,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   // call to the provider's public endpoint with the user's own key,
   // bypassing the demo-budget path entirely.
   const effectiveModel = requestedModel || persona?.model || config.agent.model;
-  const userRegistry = modelSettings.effectiveRegistry(ownerEmail ?? null);
+  const userRegistry = await modelSettings.effectiveRegistry(ownerEmail ?? null);
   // BYOK overlay: for any model that maps to a known cloud provider AND
   // for which the caller has a saved key, rewrite the registry entry to
   // route the request through the provider's public endpoint with the
@@ -870,11 +2074,11 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   // demo backend even with a BYOK key set. The wire id rewrite handles
   // providers whose UI ids include a namespace prefix (`anthropic/...`,
   // `openai/...`) but whose APIs expect bare ids on the wire.
-  function overlayBYOK(uiModelId: string): void {
+  async function overlayBYOK(uiModelId: string): Promise<void> {
     if (!ownerEmail) return;
     const cloudProvider = providerForModel(uiModelId);
     if (!cloudProvider) return;
-    const userKey = modelSettings.getProviderKey(ownerEmail, cloudProvider.id);
+    const userKey = await modelSettings.getProviderKey(ownerEmail, cloudProvider.id);
     if (!userKey) return;
     userRegistry[uiModelId] = {
       baseUrl: cloudProvider.baseUrl,
@@ -882,8 +2086,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       model: wireModelIdFor(uiModelId),
     };
   }
-  overlayBYOK(effectiveModel);
-  overlayBYOK(config.agent.simpleModel);
+  await overlayBYOK(effectiveModel);
+  await overlayBYOK(config.agent.simpleModel);
   const agent = resolveAgentTarget(effectiveModel, userRegistry, config.agent);
   const countHostedTokens =
     !!ownerEmail &&
@@ -935,7 +2139,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   // Matter and review chats resolve file bytes from the matter's bucket,
   // since that's where uploads land — the review-scoped chat's
   // `workspaceId` is just a namespace marker, not a file-store bucket.
-  let persistedChat: ReturnType<ChatsStore['getChat']> = null;
+  let persistedChat: Chat | null = null;
   // The matter id whose `fileStore` bucket holds the doc bytes for this
   // chat. For review-scoped chats this differs from `persistedChat.workspaceId`,
   // so we surface it for both attachment lookup and the docTools session.
@@ -943,7 +2147,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   let chatBucketMatterId = '';
   const matterAttachments: FileRecord[] = [];
   if (chatId) {
-    persistedChat = chats.getChat(chatId);
+    persistedChat = await chats.getChat(chatId);
     if (!persistedChat) {
       send({ type: 'error', message: 'chat not found' });
       res.end();
@@ -953,20 +2157,20 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       // Top-level Assistant chat — standalone, no matter docs.
     } else if (persistedChat.workspaceId.startsWith('review:')) {
       const reviewId = persistedChat.workspaceId.slice('review:'.length);
-      const review = reviews.getReview(reviewId);
+      const review = await reviews.getReview(reviewId);
       if (!review) {
         send({ type: 'error', message: 'review not found for chat' });
         res.end();
         return;
       }
       chatBucketMatterId = review.workspaceId;
-      for (const doc of reviews.listDocuments(reviewId)) {
+      for (const doc of await reviews.listDocuments(reviewId)) {
         const rec = fileStore.get(chatBucketMatterId, doc.externalDocId);
         if (rec) matterAttachments.push(rec);
       }
     } else {
       chatBucketMatterId = persistedChat.workspaceId;
-      for (const doc of workspaces.listDocuments(chatBucketMatterId, {})) {
+      for (const doc of await workspaces.listDocuments(chatBucketMatterId, {})) {
         const rec = fileStore.get(chatBucketMatterId, doc.externalDocId);
         if (rec) matterAttachments.push(rec);
       }
@@ -1037,7 +2241,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   // Workflow-bound tool injection. Lookup is best-effort: an unknown
   // workflowId silently degrades to inline_chat behaviour rather than
   // failing the turn, so a stale id never blocks the user.
-  const activeWorkflow = workflowId ? workflows.get(workflowId) : null;
+  const activeWorkflow = workflowId ? await workflows.get(workflowId) : null;
   const workflowDocxTools =
     activeWorkflow?.outputMode === 'generate_docx'
       ? buildGenerateDocxTools({
@@ -1135,7 +2339,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       try {
         // Persist the user turn (the original message, not the embellished
         // userContent — we don't want the [Attachments] block in stored history).
-        chats.appendMessage({
+        await chats.appendMessage({
           chatId: persistedChat.id,
           role: 'user',
           content: message,
@@ -1144,18 +2348,14 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         const parsed = parseResponse(assistantText, {
           knownDocs: allAttachments.map((a) => a.id),
         });
-        chats.appendMessage({
+        await chats.appendMessage({
           chatId: persistedChat.id,
           role: 'assistant',
           content: parsed.text,
-          toolEvents:
-            collectedToolEvents.length > 0
-              ? JSON.stringify(collectedToolEvents)
-              : null,
-          citations:
-            parsed.citations.length > 0
-              ? JSON.stringify(parsed.citations)
-              : null,
+          // @counsel/chats stores these as jsonb; pass arrays directly
+          // and let the store handle serialization.
+          toolEvents: collectedToolEvents.length > 0 ? collectedToolEvents : null,
+          citations: parsed.citations.length > 0 ? parsed.citations : null,
         });
 
         // Auto-title in two passes: synchronous trim of the first message
@@ -1171,7 +2371,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
               ? firstLine.slice(0, 60) + (firstLine.length > 60 ? '…' : '')
               : 'New chat';
           if (provisional !== persistedChat.name) {
-            chats.updateChat(persistedChat.id, { name: provisional });
+            await chats.updateChat(persistedChat.id, { name: provisional });
           }
           // Fire-and-forget the polish pass after we end the response
           // stream so the user doesn't wait on it. Pinned to the simple
@@ -1194,12 +2394,12 @@ app.post('/api/chat', requireAuth, async (req, res) => {
                 extraBody: config.agent.extraBody,
               });
               if (!polished) return;
-              const current = chats.getChat(persistedChatId);
+              const current = await chats.getChat(persistedChatId);
               // Only overwrite if the chat is still on the provisional
               // title — if the user renamed it manually in the meantime,
               // respect that.
               if (current && current.name === provisional) {
-                chats.updateChat(persistedChatId, { name: polished });
+                await chats.updateChat(persistedChatId, { name: polished });
               }
             } catch (err) {
               console.warn(
@@ -1262,36 +2462,27 @@ app.post('/api/admin/reset', requireAuth, async (_req, res) => {
   try {
     // 1. KB. Delete each document through the store so vec0 / fts5
     //    sidecars stay in sync — direct DELETEs would leave orphans.
-    const kbDocs = kbStore.list(null);
+    const kbDocs = await kbStore.list(null);
     let kbDocsDeleted = 0;
     let kbChunksDeleted = 0;
     for (const doc of kbDocs) {
       try {
-        kbStore.delete(doc.id);
+        await kbStore.delete(doc.id);
         kbDocsDeleted += 1;
         kbChunksDeleted += doc.chunkCount;
       } catch (err) {
         console.warn(`[admin/reset] kbStore.delete(${doc.id}) failed:`, err);
       }
     }
-    // 2. Everything else, in dependency order. A single transaction so a
-    //    mid-flight error rolls back cleanly. We use raw exec rather than
-    //    each store's per-row API — this is the wipe-everything path.
-    const wipe = db.transaction(() => {
-      db.exec(`
-        DELETE FROM matter_doc_index;
-        DELETE FROM chat_messages;
-        DELETE FROM chats;
-        DELETE FROM review_cells;
-        DELETE FROM review_columns;
-        DELETE FROM review_documents;
-        DELETE FROM reviews;
-        DELETE FROM workspace_documents;
-        DELETE FROM folders;
-        DELETE FROM workspaces;
-      `);
-    });
-    wipe();
+    // 2. Everything else, in dependency order. All but PersonaRegistry +
+    //    hosted-demo's TokenBudgetStore now live in Postgres via @counsel/*,
+    //    so the wipe runs against counselDb.kysely. Foreign-key cascades
+    //    handle the dependents (chat_messages → chats, review_cells →
+    //    review_columns/documents, etc.) so a top-down DELETE is enough.
+    await counselDb.kysely.deleteFrom('matter_doc_index').execute();
+    await counselDb.kysely.deleteFrom('chats').execute();
+    await counselDb.kysely.deleteFrom('reviews').execute();
+    await counselDb.kysely.deleteFrom('workspaces').execute();
     // 3. File bytes (in-memory + disk persistence). docStore lives per
     //    chat session and ages out naturally, so we don't touch it here.
     const filesDeleted = fileStore.clearAll();
@@ -1334,14 +2525,14 @@ app.post('/api/admin/reset', requireAuth, async (_req, res) => {
 app.post(
   '/api/matters/:matterId/reviews/from-workflow',
   requireAuth,
-  (req, res) => {
+  async (req, res) => {
     const matterId = String(req.params.matterId ?? '');
     const ownerId = getSessionUser(req)?.email;
     if (!ownerId) {
       res.status(401).json({ error: 'unauthenticated' });
       return;
     }
-    const matter = workspaces.getWorkspace(matterId);
+    const matter = await workspaces.getWorkspace(matterId);
     if (!matter) {
       res.status(404).json({ error: 'matter not found' });
       return;
@@ -1363,7 +2554,7 @@ app.post(
       res.status(400).json({ error: 'select at least one document' });
       return;
     }
-    const workflow = workflows.get(workflowId);
+    const workflow = await workflows.get(workflowId);
     if (!workflow) {
       res.status(404).json({ error: 'workflow not found' });
       return;
@@ -1371,7 +2562,7 @@ app.post(
     // User-owned workflows are private to their creator unless shared
     // via the sharing surface — viewers can run, editors/owners can run.
     {
-      const role = resolveWorkflowRole({
+      const role = await resolveWorkflowRole({
         workflows,
         members,
         workflowId,
@@ -1407,14 +2598,14 @@ app.post(
     // Resolve doc names + mime types from the matter so we can populate
     // review_documents. Skip ids that aren't in the matter rather than
     // failing the whole call — the client may have stale data.
-    const matterDocs = workspaces.listDocuments(matterId, {});
+    const matterDocs = await workspaces.listDocuments(matterId, {});
     const docByExternalId = new Map(
       matterDocs.map((d) => [d.externalDocId, d]),
     );
 
     try {
       const today = new Date().toLocaleDateString();
-      const review = reviews.createReview({
+      const review = await reviews.createReview({
         workspaceId: matterId,
         name: `${workflow.name} — ${today}`,
         description:
@@ -1424,7 +2615,7 @@ app.post(
       });
       for (let i = 0; i < validatedColumns.length; i++) {
         const c = validatedColumns[i]!;
-        reviews.addColumn({
+        await reviews.addColumn({
           reviewId: review.id,
           title: c.title,
           prompt: c.prompt,
@@ -1436,7 +2627,7 @@ app.post(
       for (const externalDocId of externalDocIds) {
         const matterDoc = docByExternalId.get(externalDocId);
         if (!matterDoc) continue;
-        reviews.addDocument({
+        await reviews.addDocument({
           reviewId: review.id,
           externalDocId,
           name: matterDoc.name,
@@ -1445,7 +2636,7 @@ app.post(
         });
         added += 1;
       }
-      const snapshot = reviews.getReviewSnapshot(review.id);
+      const snapshot = await reviews.getReviewSnapshot(review.id);
       res.status(201).json({
         item: snapshot,
         skipped: externalDocIds.length - added,
@@ -1474,7 +2665,7 @@ app.post(
   requireAuth,
   async (req, res) => {
     const matterId = String(req.params.matterId ?? '');
-    const matter = workspaces.getWorkspace(matterId);
+    const matter = await workspaces.getWorkspace(matterId);
     if (!matter) {
       res.status(404).json({ error: 'matter not found' });
       return;
@@ -1532,7 +2723,7 @@ app.get(
   requireAuth,
   async (req, res) => {
     const matterId = String(req.params.matterId ?? '');
-    const matter = workspaces.getWorkspace(matterId);
+    const matter = await workspaces.getWorkspace(matterId);
     if (!matter) {
       res.status(404).json({ error: 'matter not found' });
       return;

@@ -1,8 +1,8 @@
 import { Router, type NextFunction, type Request, type RequestHandler, type Response } from 'express';
-import type { MembersStore, Role, SubjectRef } from '@teamsuzie/sharing';
-import type { WorkspacesStore } from '@teamsuzie/workspaces';
-import type { WorkflowsStore } from '@teamsuzie/workflows';
-import { ROLES, ROLE_RANK } from '@teamsuzie/sharing';
+import type { MembersStore, Role } from '@counsel/sharing';
+import type { WorkspacesStore } from '@counsel/workspaces';
+import type { WorkflowsStore } from '@counsel/workflows';
+import { ROLES, ROLE_RANK } from '@counsel/sharing';
 import { getSessionUser } from './auth.js';
 
 const SUBJECT_MATTER = 'matter';
@@ -25,17 +25,17 @@ function parseRole(raw: unknown): Role | null {
  * member-less matter at boot. Multi-user production would fail-closed
  * and require manual repair instead.
  */
-export function backfillMatterOwnership(opts: {
+export async function backfillMatterOwnership(opts: {
   members: MembersStore;
   workspaces: WorkspacesStore;
   ownerEmail: string;
-}): { granted: number } {
+}): Promise<{ granted: number }> {
   const { members, workspaces, ownerEmail } = opts;
   let granted = 0;
-  for (const w of workspaces.listWorkspaces({ includeArchived: true })) {
-    const existing = members.listMembersFor({ type: SUBJECT_MATTER, id: w.id });
+  for (const w of await workspaces.listWorkspaces({ includeArchived: true })) {
+    const existing = await members.listMembersFor({ type: SUBJECT_MATTER, id: w.id });
     if (existing.length === 0) {
-      members.addMember({
+      await members.addMember({
         subjectType: SUBJECT_MATTER,
         subjectId: w.id,
         userId: ownerEmail,
@@ -46,22 +46,6 @@ export function backfillMatterOwnership(opts: {
     }
   }
   return { granted };
-}
-
-/**
- * Resolve the strongest role the session user has on a subject. Pure
- * explicit-grant lookup — ownership is encoded as an owner-role member
- * row at creation, so no implicit owner lookup is needed.
- */
-function getRoleForSession(
-  members: MembersStore,
-  subject: SubjectRef,
-  req: Request,
-): { userId: string; role: Role } | null {
-  const userId = getSessionUser(req)?.email;
-  if (!userId) return null;
-  const role = members.getRole(subject, userId);
-  return role ? { userId, role } : null;
 }
 
 /**
@@ -77,7 +61,7 @@ export function createRequireMatterAccess(opts: {
   workspaces: WorkspacesStore;
 }): RequestHandler {
   const { members, workspaces } = opts;
-  return (req: Request, res: Response, next: NextFunction): void => {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     const matterId = String(req.params.matterId ?? '');
     if (!matterId) {
       res.status(400).json({ error: 'matterId required' });
@@ -88,11 +72,11 @@ export function createRequireMatterAccess(opts: {
       res.status(401).json({ error: 'unauthenticated' });
       return;
     }
-    if (!workspaces.getWorkspace(matterId)) {
+    if (!(await workspaces.getWorkspace(matterId))) {
       res.status(404).json({ error: 'matter not found' });
       return;
     }
-    const role = members.getRole({ type: SUBJECT_MATTER, id: matterId }, userId);
+    const role = await members.getRole({ type: SUBJECT_MATTER, id: matterId }, userId);
     if (!role) {
       res.status(403).json({ error: 'forbidden' });
       return;
@@ -114,18 +98,21 @@ export function createMatterMembersRouter(opts: {
   const { members, workspaces } = opts;
   const router: Router = Router({ mergeParams: true });
 
-  function requireOwner(req: Request, res: Response): { matterId: string; userId: string } | null {
+  async function requireOwner(
+    req: Request,
+    res: Response,
+  ): Promise<{ matterId: string; userId: string } | null> {
     const matterId = String((req.params as { matterId?: string }).matterId ?? '');
     const session = getSessionUser(req);
     if (!session?.email) {
       res.status(401).json({ error: 'unauthenticated' });
       return null;
     }
-    if (!workspaces.getWorkspace(matterId)) {
+    if (!(await workspaces.getWorkspace(matterId))) {
       res.status(404).json({ error: 'matter not found' });
       return null;
     }
-    const role = members.getRole({ type: SUBJECT_MATTER, id: matterId }, session.email);
+    const role = await members.getRole({ type: SUBJECT_MATTER, id: matterId }, session.email);
     if (role !== 'owner') {
       res.status(403).json({ error: 'forbidden' });
       return null;
@@ -133,7 +120,7 @@ export function createMatterMembersRouter(opts: {
     return { matterId, userId: session.email };
   }
 
-  router.get('/', (req, res) => {
+  router.get('/', async (req, res) => {
     // Any member can list — needed for the share dialog to render the
     // current state for editors/viewers, even if they can't mutate it.
     const matterId = String((req.params as { matterId?: string }).matterId ?? '');
@@ -142,21 +129,21 @@ export function createMatterMembersRouter(opts: {
       res.status(401).json({ error: 'unauthenticated' });
       return;
     }
-    if (!workspaces.getWorkspace(matterId)) {
+    if (!(await workspaces.getWorkspace(matterId))) {
       res.status(404).json({ error: 'matter not found' });
       return;
     }
-    const role = members.getRole({ type: SUBJECT_MATTER, id: matterId }, session.email);
+    const role = await members.getRole({ type: SUBJECT_MATTER, id: matterId }, session.email);
     if (!role) {
       res.status(403).json({ error: 'forbidden' });
       return;
     }
-    const items = members.listMembersFor({ type: SUBJECT_MATTER, id: matterId });
+    const items = await members.listMembersFor({ type: SUBJECT_MATTER, id: matterId });
     res.json({ items, role });
   });
 
-  router.post('/', (req, res) => {
-    const ctx = requireOwner(req, res);
+  router.post('/', async (req, res) => {
+    const ctx = await requireOwner(req, res);
     if (!ctx) return;
     const inviteEmail = lowerEmail(req.body?.email);
     const role = parseRole(req.body?.role);
@@ -168,7 +155,7 @@ export function createMatterMembersRouter(opts: {
       res.status(400).json({ error: 'role must be one of owner, editor, viewer' });
       return;
     }
-    const member = members.addMember({
+    const member = await members.addMember({
       subjectType: SUBJECT_MATTER,
       subjectId: ctx.matterId,
       userId: inviteEmail,
@@ -178,8 +165,8 @@ export function createMatterMembersRouter(opts: {
     res.status(201).json({ item: member });
   });
 
-  router.delete('/:userId', (req, res) => {
-    const ctx = requireOwner(req, res);
+  router.delete('/:userId', async (req, res) => {
+    const ctx = await requireOwner(req, res);
     if (!ctx) return;
     const target = lowerEmail(req.params.userId);
     if (!target) {
@@ -188,14 +175,14 @@ export function createMatterMembersRouter(opts: {
     }
     // Block removing the last owner — keeps every matter reachable by
     // at least one user.
-    const all = members.listMembersFor({ type: SUBJECT_MATTER, id: ctx.matterId });
+    const all = await members.listMembersFor({ type: SUBJECT_MATTER, id: ctx.matterId });
     const owners = all.filter((m) => m.role === 'owner');
     const targetIsOwner = owners.some((m) => m.userId === target);
     if (targetIsOwner && owners.length <= 1) {
       res.status(400).json({ error: 'cannot remove the last owner' });
       return;
     }
-    const removed = members.removeMember(SUBJECT_MATTER, ctx.matterId, target);
+    const removed = await members.removeMember(SUBJECT_MATTER, ctx.matterId, target);
     if (!removed) {
       res.status(404).json({ error: 'member not found' });
       return;
@@ -212,20 +199,20 @@ export function createMatterMembersRouter(opts: {
  * `GET /api/workflows`, `GET /:id`, and the from-workflow review
  * launch. Owner / editor can edit; viewer can only run.
  */
-export function listVisibleWorkflowsForUser(opts: {
+export async function listVisibleWorkflowsForUser(opts: {
   workflows: WorkflowsStore;
   members: MembersStore;
   ownerId: string;
   includeArchived?: boolean;
 }) {
   const { workflows, members, ownerId, includeArchived } = opts;
-  const owned = workflows.listVisible({ ownerId, includeArchived });
+  const owned = await workflows.listVisible({ ownerId, includeArchived });
   const ownedIds = new Set(owned.map((w) => w.id));
-  const sharedSubjects = members.listSubjectsFor(ownerId, SUBJECT_WORKFLOW);
+  const sharedSubjects = await members.listSubjectsFor(ownerId, SUBJECT_WORKFLOW);
   const extras = [];
   for (const sub of sharedSubjects) {
     if (ownedIds.has(sub.subjectId)) continue;
-    const wf = workflows.get(sub.subjectId);
+    const wf = await workflows.get(sub.subjectId);
     if (!wf) continue;
     if (!includeArchived && wf.archivedAt !== null) continue;
     extras.push(wf);
@@ -240,18 +227,18 @@ export function listVisibleWorkflowsForUser(opts: {
  * users' rows depend on explicit grants. Returns null when the user has
  * no path to the workflow.
  */
-export function resolveWorkflowRole(opts: {
+export async function resolveWorkflowRole(opts: {
   workflows: WorkflowsStore;
   members: MembersStore;
   workflowId: string;
   userId: string;
-}): Role | null {
+}): Promise<Role | null> {
   const { workflows, members, workflowId, userId } = opts;
-  const wf = workflows.get(workflowId);
+  const wf = await workflows.get(workflowId);
   if (!wf) return null;
   // System rows: every authenticated user can read + run, but no edit.
   if (wf.source === 'system') {
-    const explicit = members.getRole({ type: SUBJECT_WORKFLOW, id: workflowId }, userId);
+    const explicit = await members.getRole({ type: SUBJECT_WORKFLOW, id: workflowId }, userId);
     if (explicit && ROLE_RANK[explicit] > ROLE_RANK['viewer']) return explicit;
     return 'viewer';
   }
@@ -272,17 +259,17 @@ export function createWorkflowMembersRouter(opts: {
   const { members, workflows } = opts;
   const router: Router = Router({ mergeParams: true });
 
-  function requireOwnerOrEditor(
+  async function requireOwnerOrEditor(
     req: Request,
     res: Response,
-  ): { workflowId: string; userId: string; role: Role } | null {
+  ): Promise<{ workflowId: string; userId: string; role: Role } | null> {
     const workflowId = String((req.params as { workflowId?: string }).workflowId ?? '');
     const session = getSessionUser(req);
     if (!session?.email) {
       res.status(401).json({ error: 'unauthenticated' });
       return null;
     }
-    const role = resolveWorkflowRole({
+    const role = await resolveWorkflowRole({
       workflows,
       members,
       workflowId,
@@ -299,14 +286,14 @@ export function createWorkflowMembersRouter(opts: {
     return { workflowId, userId: session.email, role };
   }
 
-  router.get('/', (req, res) => {
+  router.get('/', async (req, res) => {
     const workflowId = String((req.params as { workflowId?: string }).workflowId ?? '');
     const session = getSessionUser(req);
     if (!session?.email) {
       res.status(401).json({ error: 'unauthenticated' });
       return;
     }
-    const role = resolveWorkflowRole({
+    const role = await resolveWorkflowRole({
       workflows,
       members,
       workflowId,
@@ -316,15 +303,15 @@ export function createWorkflowMembersRouter(opts: {
       res.status(404).json({ error: 'workflow not found' });
       return;
     }
-    const items = members.listMembersFor({ type: SUBJECT_WORKFLOW, id: workflowId });
+    const items = await members.listMembersFor({ type: SUBJECT_WORKFLOW, id: workflowId });
     res.json({ items, role });
   });
 
-  router.post('/', (req, res) => {
-    const ctx = requireOwnerOrEditor(req, res);
+  router.post('/', async (req, res) => {
+    const ctx = await requireOwnerOrEditor(req, res);
     if (!ctx) return;
     // Sharing system workflows is a no-op — every user already sees them.
-    const wf = workflows.get(ctx.workflowId)!;
+    const wf = (await workflows.get(ctx.workflowId))!;
     if (wf.source === 'system') {
       res.status(400).json({ error: 'system workflows are visible to all users' });
       return;
@@ -345,7 +332,7 @@ export function createWorkflowMembersRouter(opts: {
       res.status(400).json({ error: 'cannot share with the workflow creator' });
       return;
     }
-    const member = members.addMember({
+    const member = await members.addMember({
       subjectType: SUBJECT_WORKFLOW,
       subjectId: ctx.workflowId,
       userId: inviteEmail,
@@ -355,15 +342,15 @@ export function createWorkflowMembersRouter(opts: {
     res.status(201).json({ item: member });
   });
 
-  router.delete('/:userId', (req, res) => {
-    const ctx = requireOwnerOrEditor(req, res);
+  router.delete('/:userId', async (req, res) => {
+    const ctx = await requireOwnerOrEditor(req, res);
     if (!ctx) return;
     const target = lowerEmail(req.params.userId);
     if (!target) {
       res.status(400).json({ error: 'userId required' });
       return;
     }
-    const removed = members.removeMember(SUBJECT_WORKFLOW, ctx.workflowId, target);
+    const removed = await members.removeMember(SUBJECT_WORKFLOW, ctx.workflowId, target);
     if (!removed) {
       res.status(404).json({ error: 'member not found' });
       return;

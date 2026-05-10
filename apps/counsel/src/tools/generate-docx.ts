@@ -4,7 +4,7 @@ import {
   type GenerateDocxSection,
   type GenerateDocxSpec,
 } from '@teamsuzie/docx';
-import type { DocumentVersionsStore } from '@teamsuzie/document-versions';
+import type { DocumentVersionsStore } from '@counsel/document-versions';
 import type { FileRecord, InMemoryFileStore } from '../files.js';
 
 interface BuildOptions {
@@ -178,7 +178,7 @@ export function buildGenerateDocxTools(
       let versionId: string | undefined;
       if (documentVersions) {
         try {
-          const v = documentVersions.addVersion({
+          const v = await documentVersions.addVersion({
             externalDocId: fileId,
             parentId: null,
             source: 'generated',
