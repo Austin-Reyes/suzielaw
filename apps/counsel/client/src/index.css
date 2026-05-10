@@ -1,6 +1,6 @@
 @import "tailwindcss";
 
-@source "../../../../../open_teamsuzie/packages/ui/src/**/*.{ts,tsx}";
+@source "../../../../../agents/packages/ui/src/**/*.{ts,tsx}";
 @source "./**/*.{ts,tsx}";
 
 @theme {
