@@ -1,6 +1,7 @@
 import { citationProtocolFragment } from '@teamsuzie/citations';
 import type { WorkspacesStore } from '@counsel/workspaces';
 import type { MatterRag } from './matter-rag.js';
+import { ingestZip, ZipIngestError } from './zip-ingest.js';
 import { Router, json as expressJson, type Request, type Response } from 'express';
 import multer from 'multer';
 import {
@@ -32,13 +33,32 @@ export interface FileMetadata {
   size: number;
 }
 
-interface FileMetaSidecar {
+export interface FileMetaSidecar {
   id: string;
   sessionId: string;
   name: string;
   mimeType: string;
   size: number;
   createdAt: number;
+}
+
+/**
+ * File bytes now support both local in-memory/disk storage and Azure Blob
+ * storage. The contract is async because blob reads/writes are remote I/O;
+ * InMemoryFileStore resolves immediately so local dev behavior stays the same.
+ */
+export interface FileStore {
+  put(record: FileRecord): Promise<void>;
+  get(sessionId: string, fileId: string): Promise<FileRecord | undefined>;
+  getMany(sessionId: string, fileIds: string[]): Promise<FileRecord[]>;
+  copyMany(
+    fromSessionId: string,
+    toSessionId: string,
+    fileIds: string[],
+  ): Promise<FileMetadata[]>;
+  delete(sessionId: string, fileId: string): Promise<boolean>;
+  clearSession(sessionId: string): Promise<void>;
+  clearAll(): Promise<number>;
 }
 
 /**
@@ -56,7 +76,7 @@ export interface InMemoryFileStoreOptions {
   dataDir?: string | null;
 }
 
-export class InMemoryFileStore {
+export class InMemoryFileStore implements FileStore {
   private bySession: Map<string, Map<string, FileRecord>> = new Map();
   private readonly dataDir: string | null;
 
@@ -65,7 +85,7 @@ export class InMemoryFileStore {
     if (this.dataDir) this.loadFromDisk(this.dataDir);
   }
 
-  put(record: FileRecord): void {
+  async put(record: FileRecord): Promise<void> {
     let sess = this.bySession.get(record.sessionId);
     if (!sess) {
       sess = new Map();
@@ -75,11 +95,11 @@ export class InMemoryFileStore {
     if (this.dataDir) this.writeToDisk(this.dataDir, record);
   }
 
-  get(sessionId: string, fileId: string): FileRecord | undefined {
+  async get(sessionId: string, fileId: string): Promise<FileRecord | undefined> {
     return this.bySession.get(sessionId)?.get(fileId);
   }
 
-  getMany(sessionId: string, fileIds: string[]): FileRecord[] {
+  async getMany(sessionId: string, fileIds: string[]): Promise<FileRecord[]> {
     const sess = this.bySession.get(sessionId);
     if (!sess) return [];
     const out: FileRecord[] = [];
@@ -90,15 +110,19 @@ export class InMemoryFileStore {
     return out;
   }
 
-  copyMany(fromSessionId: string, toSessionId: string, fileIds: string[]): FileMetadata[] {
+  async copyMany(
+    fromSessionId: string,
+    toSessionId: string,
+    fileIds: string[],
+  ): Promise<FileMetadata[]> {
     const copied: FileMetadata[] = [];
-    for (const rec of this.getMany(fromSessionId, fileIds)) {
+    for (const rec of await this.getMany(fromSessionId, fileIds)) {
       const next: FileRecord = {
         ...rec,
         sessionId: toSessionId,
         bytes: Buffer.from(rec.bytes),
       };
-      this.put(next);
+      await this.put(next);
       copied.push({
         id: next.id,
         name: next.name,
@@ -109,7 +133,7 @@ export class InMemoryFileStore {
     return copied;
   }
 
-  delete(sessionId: string, fileId: string): boolean {
+  async delete(sessionId: string, fileId: string): Promise<boolean> {
     const removed = this.bySession.get(sessionId)?.delete(fileId) ?? false;
     if (removed && this.dataDir) {
       this.removeFromDisk(this.dataDir, sessionId, fileId);
@@ -117,7 +141,7 @@ export class InMemoryFileStore {
     return removed;
   }
 
-  clearSession(sessionId: string): void {
+  async clearSession(sessionId: string): Promise<void> {
     this.bySession.delete(sessionId);
     if (this.dataDir) this.removeBucketFromDisk(this.dataDir, sessionId);
   }
@@ -126,7 +150,7 @@ export class InMemoryFileStore {
    * Drop every bucket — used by the admin "reset everything" path. Returns
    * the number of file records that were in memory at the time of the call.
    */
-  clearAll(): number {
+  async clearAll(): Promise<number> {
     let count = 0;
     for (const sess of this.bySession.values()) count += sess.size;
     this.bySession.clear();
@@ -290,7 +314,7 @@ export function buildCitationProtocolBlock(records: FileRecord[]): string {
 }
 
 export interface FileRouterOptions {
-  store: InMemoryFileStore;
+  store: FileStore;
   maxUploadBytes: number;
 }
 
@@ -301,7 +325,7 @@ export function createFilesRouter({ store, maxUploadBytes }: FileRouterOptions):
     limits: { fileSize: maxUploadBytes },
   });
 
-  router.post('/files', upload.single('file'), (req: Request, res: Response) => {
+  router.post('/files', upload.single('file'), async (req: Request, res: Response) => {
     const sessionId = String(req.body?.sessionId || '').trim();
     if (!sessionId) {
       res.status(400).json({ error: 'sessionId is required (form field)' });
@@ -326,17 +350,22 @@ export function createFilesRouter({ store, maxUploadBytes }: FileRouterOptions):
       bytes: file.buffer,
       createdAt: Date.now(),
     };
-    store.put(record);
+    await store.put(record);
     const metadata: FileMetadata = {
       id: record.id,
       name: record.name,
       mimeType: record.mimeType,
       size: record.size,
     };
+    req.audit('file.upload', {
+      subjectType: 'file',
+      subjectId: record.id,
+      metadata: { mime: record.mimeType, size: record.size, sessionId },
+    });
     res.status(201).json({ item: metadata });
   });
 
-  router.post('/files/promote', expressJson(), (req: Request, res: Response) => {
+  router.post('/files/promote', expressJson(), async (req: Request, res: Response) => {
     const fromSessionId = String(req.body?.fromSessionId || '').trim();
     const toSessionId = String(req.body?.toSessionId || '').trim();
     const fileIds = Array.isArray(req.body?.fileIds)
@@ -350,11 +379,11 @@ export function createFilesRouter({ store, maxUploadBytes }: FileRouterOptions):
       res.json({ items: [] });
       return;
     }
-    res.json({ items: store.copyMany(fromSessionId, toSessionId, fileIds) });
+    res.json({ items: await store.copyMany(fromSessionId, toSessionId, fileIds) });
   });
 
-  router.get('/files/:sessionId/:id', (req, res) => {
-    const rec = store.get(req.params.sessionId, req.params.id);
+  router.get('/files/:sessionId/:id', async (req, res) => {
+    const rec = await store.get(req.params.sessionId, req.params.id);
     if (!rec) {
       res.status(404).json({ error: 'not found' });
       return;
@@ -369,12 +398,17 @@ export function createFilesRouter({ store, maxUploadBytes }: FileRouterOptions):
     });
   });
 
-  router.get('/files/:sessionId/:id/content', (req, res) => {
-    const rec = store.get(req.params.sessionId, req.params.id);
+  router.get('/files/:sessionId/:id/content', async (req, res) => {
+    const rec = await store.get(req.params.sessionId, req.params.id);
     if (!rec) {
       res.status(404).json({ error: 'not found' });
       return;
     }
+    req.audit('file.download', {
+      subjectType: 'file',
+      subjectId: rec.id,
+      metadata: { sessionId: rec.sessionId, mime: rec.mimeType },
+    });
     // PDFs and images render inline in browsers; everything else (DOCX,
     // XLSX, PPTX, ...) does not, so an `inline` disposition causes the
     // SPA to navigate-then-fail when a markdown link in chat is clicked.
@@ -395,12 +429,17 @@ export function createFilesRouter({ store, maxUploadBytes }: FileRouterOptions):
     res.send(rec.bytes);
   });
 
-  router.delete('/files/:sessionId/:id', (req, res) => {
-    const removed = store.delete(req.params.sessionId, req.params.id);
+  router.delete('/files/:sessionId/:id', async (req, res) => {
+    const removed = await store.delete(req.params.sessionId, req.params.id);
     if (!removed) {
       res.status(404).json({ error: 'not found' });
       return;
     }
+    req.audit('file.delete', {
+      subjectType: 'file',
+      subjectId: String(req.params.id ?? ''),
+      metadata: { sessionId: String(req.params.sessionId ?? '') },
+    });
     res.json({ ok: true });
   });
 
@@ -408,9 +447,15 @@ export function createFilesRouter({ store, maxUploadBytes }: FileRouterOptions):
 }
 
 export interface MatterUploadsRouterOptions {
-  fileStore: InMemoryFileStore;
+  fileStore: FileStore;
   workspaces: WorkspacesStore;
   maxUploadBytes: number;
+  /** Per-zip-upload cap. Larger than maxUploadBytes because a zip is many
+   *  files. Defaults to 500 MB in the router if unset. */
+  maxArchiveBytes?: number;
+  /** markitdown-agent base URL. Required for the zip-ingest /upload-archive
+   *  route; ignored for single-file uploads. */
+  markitdownBaseUrl?: string;
   /** Optional: if set, every uploaded matter doc is also indexed into the
    *  KB so cell runs (and later matter chats) can do RAG against it. */
   rag?: MatterRag;
@@ -421,7 +466,7 @@ export interface MatterUploadsRouterOptions {
 }
 
 /**
- * Bridges multipart upload → InMemoryFileStore (bucket = matter id) →
+ * Bridges multipart upload → FileStore (bucket = matter id) →
  * `workspace_documents` row. The download URL is the existing
  * `/api/files/:bucket/:fileId/content` endpoint, with the matter id as the
  * bucket — so matter docs are served by the same plumbing as chat-session
@@ -435,6 +480,8 @@ export function createMatterUploadsRouter({
   fileStore,
   workspaces,
   maxUploadBytes,
+  maxArchiveBytes = 500 * 1024 * 1024,
+  markitdownBaseUrl,
   rag,
   documentVersions,
 }: MatterUploadsRouterOptions): Router {
@@ -442,6 +489,10 @@ export function createMatterUploadsRouter({
   const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: maxUploadBytes },
+  });
+  const archiveUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: maxArchiveBytes },
   });
 
   router.post(
@@ -479,7 +530,7 @@ export function createMatterUploadsRouter({
         bytes: file.buffer,
         createdAt: Date.now(),
       };
-      fileStore.put(record);
+      await fileStore.put(record);
 
       const doc = await workspaces.addDocument({
         workspaceId: matterId,
@@ -504,7 +555,7 @@ export function createMatterUploadsRouter({
           });
         } catch (err) {
           console.warn(
-            `[document-versions] addVersion(upload) failed for ${record.name}:`,
+            `[document-versions] addVersion(upload) failed for file_id=${record.id}:`,
             err instanceof Error ? err.message : err,
           );
         }
@@ -519,26 +570,141 @@ export function createMatterUploadsRouter({
           const elapsed = Date.now() - startedAt;
           if (result.ok) {
             console.log(
-              `[matter-rag] indexed ${record.name} → ${result.chunkCount} chunk(s) in ${elapsed}ms`,
+              `[matter-rag] indexed file_id=${record.id} → ${result.chunkCount} chunk(s) in ${elapsed}ms`,
             );
           } else {
             console.warn(
-              `[matter-rag] skipped ${record.name} (${elapsed}ms): ${result.reason}`,
+              `[matter-rag] skipped file_id=${record.id} (${elapsed}ms): ${result.reason}`,
             );
           }
         } catch (err) {
           console.warn(
-            `[matter-rag] indexFile failed for ${record.name}:`,
+            `[matter-rag] indexFile failed for file_id=${record.id}:`,
             err instanceof Error ? err.message : err,
           );
         }
       } else {
         console.log(
-          `[matter-rag] no rag adapter configured — skipping index for ${record.name}`,
+          `[matter-rag] no rag adapter configured — skipping index for file_id=${record.id}`,
         );
       }
 
+      req.audit('file.upload', {
+        subjectType: 'file',
+        subjectId: fileId,
+        metadata: { matterId, mime: record.mimeType, size: record.size },
+      });
       res.status(201).json({ item: doc });
+    },
+  );
+
+  /**
+   * Zip-archive upload: Litify/Docrio matter export. Streams progress as
+   * Server-Sent Events so the composer can show "Processing N of M…"
+   * while the pipeline grinds through classify + OCR. The terminal event
+   * is `manifest` carrying the per-file outcome list.
+   *
+   * Wire format (one `event:` per line per the SSE spec):
+   *   event: progress
+   *   data: {"processed":42,"total":196,"stage":"index"}
+   *
+   *   event: manifest
+   *   data: { ... ZipManifest ... }
+   *
+   *   event: error
+   *   data: {"error":"too_large","message":"…"}
+   *
+   * The connection closes after `manifest` or `error`.
+   */
+  router.post(
+    '/:matterId/documents/upload-archive',
+    archiveUpload.single('file'),
+    async (req, res) => {
+      const matterId = String(req.params.matterId ?? '');
+      if (!(await workspaces.getWorkspace(matterId))) {
+        res.status(404).json({ error: 'matter not found' });
+        return;
+      }
+      const file = req.file;
+      if (!file) {
+        res.status(400).json({ error: 'file is required (multipart field "file")' });
+        return;
+      }
+      if (!rag) {
+        res.status(503).json({ error: 'rag adapter not configured' });
+        return;
+      }
+      if (!markitdownBaseUrl) {
+        res.status(503).json({ error: 'markitdown-agent not configured' });
+        return;
+      }
+
+      // SSE headers. `X-Accel-Buffering: no` keeps reverse proxies (Nginx,
+      // Azure Front Door) from buffering ticks — without it the client
+      // sees the full response only at the end. flushHeaders so the
+      // connection opens before the first yield.
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+
+      const send = (event: string, data: unknown) => {
+        res.write(`event: ${event}\n`);
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+
+      try {
+        const gen = ingestZip({
+          matterId,
+          zipBytes: file.buffer,
+          zipFilename: file.originalname || 'archive.zip',
+          workspaces,
+          fileStore,
+          rag,
+          markitdownBaseUrl,
+        });
+        let manifest;
+        while (true) {
+          const next = await gen.next();
+          if (next.done) {
+            manifest = next.value;
+            break;
+          }
+          send('progress', next.value);
+        }
+        req.audit('zip.upload', {
+          subjectType: 'matter',
+          subjectId: matterId,
+          metadata: { summary: manifest.summary },
+        });
+        send('manifest', manifest);
+      } catch (err) {
+        if (err instanceof ZipIngestError) {
+          req.audit('zip.upload.error', {
+            subjectType: 'matter',
+            subjectId: matterId,
+            metadata: { code: err.code },
+          });
+          send('error', { error: err.code, message: err.message });
+        } else {
+          req.audit('zip.upload.error', {
+            subjectType: 'matter',
+            subjectId: matterId,
+            metadata: { code: 'pipeline_error' },
+          });
+          console.error(
+            '[zip-ingest] pipeline crashed:',
+            err instanceof Error ? err.message : String(err),
+          );
+          send('error', {
+            error: 'pipeline_error',
+            message: err instanceof Error ? err.message : 'Unknown error',
+          });
+        }
+      } finally {
+        res.end();
+      }
     },
   );
 

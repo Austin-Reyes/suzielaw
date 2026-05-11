@@ -11,7 +11,7 @@ import type { KbSearchHit } from '@counsel/kb';
 import type { Request } from 'express';
 
 import type { CellChatMessage } from '@teamsuzie/grid-review';
-import type { InMemoryFileStore } from './files.js';
+import type { FileStore } from './files.js';
 import { convertFileToMarkdown } from './document-tools.js';
 import { rewriteQueryAsHypothetical } from './hyde.js';
 import type { MatterRag } from './matter-rag.js';
@@ -19,7 +19,7 @@ import { createTokenMeteredFetch, type TokenBudgetStore } from '@teamsuzie/hoste
 import { getSessionUser } from './auth.js';
 
 export interface BuildReviewRunAdapterOptions {
-  fileStore: InMemoryFileStore;
+  fileStore: FileStore;
   rag: MatterRag;
   markitdownBaseUrl: string;
   agentBaseUrl: string;
@@ -153,7 +153,7 @@ export function buildReviewRunAdapter(
         }
       } else {
         // Legacy full-doc fallback.
-        const record = opts.fileStore.get(workspaceId, document.externalDocId);
+        const record = await opts.fileStore.get(workspaceId, document.externalDocId);
         if (!record) {
           yield {
             type: 'error',

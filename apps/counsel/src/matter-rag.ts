@@ -107,13 +107,56 @@ export class MatterRag {
         };
     }
 
+    /**
+     * Variant of indexFile that takes pre-extracted markdown instead of
+     * running markitdown-agent's /convert again. Used by the zip-ingest
+     * path where /classify already returned the markdown for text files
+     * and /ocr returned it for image-PDFs — re-calling /convert would
+     * double the markitdown work for every file in a 200-file zip.
+     *
+     * Same idempotency contract as indexFile.
+     */
+    async indexFileWithMarkdown(
+        matterId: string,
+        record: FileRecord,
+        markdown: string,
+    ): Promise<
+        | { ok: true; kbDocId: string; chunkCount: number }
+        | { ok: false; reason: string }
+    > {
+        if (!markdown.trim()) {
+            return { ok: false, reason: 'empty markdown' };
+        }
+        const prior = await this.lookupKbDocId(matterId, record.id);
+        if (prior) {
+            try {
+                await this.kb.delete(prior);
+            } catch {
+                /* noop — best-effort cleanup */
+            }
+            await this.deleteMapping(matterId, record.id);
+        }
+        const inserted = await this.kb.insert({
+            name: record.name,
+            mimeType: record.mimeType,
+            size: record.size,
+            markdown,
+            ownerId: ownerIdForMatter(matterId),
+        });
+        await this.recordMapping(matterId, record.id, inserted.id);
+        return {
+            ok: true,
+            kbDocId: inserted.id,
+            chunkCount: inserted.chunkCount,
+        };
+    }
+
     /** Drop a file's KB index + mapping, e.g. when a matter doc is removed. */
     async removeFile(matterId: string, fileId: string): Promise<void> {
         const kbDocId = await this.lookupKbDocId(matterId, fileId);
         if (!kbDocId) return;
-        // Snapshot name + chunk count before delete so the success log can
-        // report what came out, mirroring the upload path's "indexed X →
-        // N chunk(s)" line.
+        // Snapshot chunk count before delete so the success log can report
+        // what came out without printing the PHI-bearing document name.
         const docBefore = await this.kb.get(kbDocId);
         const startedAt = Date.now();
         let kbDeleteOk = true;
@@ -133,10 +176,9 @@ export class MatterRag {
         if (kbDeleteOk) {
             await this.deleteMapping(matterId, fileId);
             const elapsed = Date.now() - startedAt;
-            const name = docBefore?.name ?? fileId;
             const chunks = docBefore?.chunkCount ?? 0;
             console.log(
-                `[matter-rag] removed ${name} → ${chunks} chunk(s) dropped in ${elapsed}ms`,
+                `[matter-rag] removed file_id=${fileId} → ${chunks} chunk(s) dropped in ${elapsed}ms`,
             );
         }
     }

@@ -109,11 +109,44 @@ export const config = {
   },
   /**
    * Per-model agent overrides — used by `resolveAgentTarget` to route the
-   * chat call to a different base URL when the user picks a Local model.
-   * Built from `${COUNSEL_LOCAL_<NAME>_BASE_URL,_API_KEY}` env vars per
-   * the upstream `LOCAL_MODELS` list.
+   * chat call to a different base URL/key when the user picks a non-default
+   * model. Built from:
+   *   - Local model env vars: `${COUNSEL_LOCAL_<NAME>_BASE_URL,_API_KEY}`
+   *     per the upstream `LOCAL_MODELS` list.
+   *   - Firm-paid cloud model env vars: `COUNSEL_ANTHROPIC_API_KEY` +
+   *     `COUNSEL_ANTHROPIC_BASE_URL` + `COUNSEL_MODEL_ANTHROPIC_SONNET`
+   *     for Claude Sonnet 4.6 (single firm BAA-covered key, no per-user
+   *     BYOK). OpenAI's default model uses `config.agent.{baseUrl,apiKey}`
+   *     so it doesn't need a registry entry.
    */
-  modelAgents: buildLocalAgentRegistry(LOCAL_MODELS, process.env, 'SUZIELAW'),
+  modelAgents: (() => {
+    const local = buildLocalAgentRegistry(LOCAL_MODELS, process.env, 'SUZIELAW');
+    const anthropicKey = process.env.COUNSEL_ANTHROPIC_API_KEY;
+    const anthropicBaseUrl = (process.env.COUNSEL_ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/$/, '');
+    const sonnetUiId = process.env.COUNSEL_MODEL_ANTHROPIC_SONNET_UI_ID || 'anthropic/claude-sonnet-4-6';
+    const sonnetWireId = process.env.COUNSEL_MODEL_ANTHROPIC_SONNET || 'claude-sonnet-4-6';
+    if (anthropicKey) {
+      local[sonnetUiId] = {
+        baseUrl: anthropicBaseUrl,
+        apiKey: anthropicKey,
+        model: sonnetWireId,
+      };
+    }
+    return local;
+  })(),
+  /**
+   * Firm-approved cloud model UI ids. The chat handler accepts these
+   * without requiring a per-user BYOK key — they route via the firm's
+   * BAA-covered keys configured in `modelAgents` (Anthropic) or the
+   * default agent (OpenAI). Empty by default; pilot wires Sonnet here.
+   */
+  firmCloudModelIds: (() => {
+    const ids: string[] = [];
+    if (process.env.COUNSEL_ANTHROPIC_API_KEY) {
+      ids.push(process.env.COUNSEL_MODEL_ANTHROPIC_SONNET_UI_ID || 'anthropic/claude-sonnet-4-6');
+    }
+    return ids;
+  })(),
   personas: {
     /** Directory of `<id>/PERSONA.md` files for builtin personas. Empty/unset
      *  means no builtins are loaded — user-created personas still work. */
@@ -146,6 +179,11 @@ export const config = {
      */
     trustEasyAuth: ['1', 'true', 'yes'].includes(
       (process.env.COUNSEL_TRUST_EASY_AUTH || '').toLowerCase(),
+    ),
+  },
+  admin: {
+    emails: parseList(process.env.COUNSEL_ADMIN_EMAILS).map((email) =>
+      email.toLowerCase(),
     ),
   },
   oauth: {

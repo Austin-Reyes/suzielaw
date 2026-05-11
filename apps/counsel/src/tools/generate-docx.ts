@@ -5,12 +5,12 @@ import {
   type GenerateDocxSpec,
 } from '@teamsuzie/docx';
 import type { DocumentVersionsStore } from '@counsel/document-versions';
-import type { FileRecord, InMemoryFileStore } from '../files.js';
+import type { FileRecord, FileStore } from '../files.js';
 
 interface BuildOptions {
   /** Bucket id for the file store (matter id for matter chats, chat id otherwise). */
   sessionId: string;
-  fileStore: InMemoryFileStore;
+  fileStore: FileStore;
   /** Origin (e.g. http://localhost:17501) to make download_url absolute. */
   originUrl?: string;
   /** When set, every successful generation records a `source: 'generated'`
@@ -167,7 +167,7 @@ export function buildGenerateDocxTools(
         bytes,
         createdAt: Date.now(),
       };
-      fileStore.put(record);
+      await fileStore.put(record);
 
       // Record a `source: 'generated'` version. Each run is its own
       // logical document — `externalDocId = fileId` so re-runs of the
@@ -204,6 +204,7 @@ export function buildGenerateDocxTools(
         download_url: downloadUrl,
         download_file_id: fileId,
         download_filename: filename,
+        bytes: bytes.length,
         section_count: sections.length,
         version_id: versionId,
       };

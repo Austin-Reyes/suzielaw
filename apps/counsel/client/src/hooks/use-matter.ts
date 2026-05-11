@@ -23,6 +23,39 @@ export interface MatterDocument {
   addedAt: number;
 }
 
+export type ZipEntryKind = 'text' | 'ocrd' | 'attached' | 'duplicate' | 'failed';
+
+export interface ZipEntryResult {
+  path: string;
+  displayName: string;
+  kind: ZipEntryKind;
+  sha256?: string;
+  size: number;
+  documentId?: string;
+  duplicateOfDocumentId?: string;
+  reason?: string;
+}
+
+export interface ZipManifest {
+  zipFilename: string;
+  totalEntries: number;
+  processedEntries: number;
+  summary: {
+    text: number;
+    ocrd: number;
+    attached: number;
+    duplicates: number;
+    failed: number;
+  };
+  entries: ZipEntryResult[];
+}
+
+export interface ZipUploadProgress {
+  processed: number;
+  total: number;
+  stage: 'reading' | 'classify' | 'ocr' | 'index' | 'done';
+}
+
 interface UseMatterResult {
   matter: Matter | null;
   folders: MatterFolder[];
@@ -35,6 +68,13 @@ interface UseMatterResult {
   moveFolder: (folderId: string, newParentFolderId: string | null) => Promise<void>;
   deleteFolder: (folderId: string) => Promise<void>;
   uploadDocument: (file: File, folderId?: string | null) => Promise<MatterDocument>;
+  /** Zip-archive upload with SSE progress. Resolves with the final manifest;
+   *  call `onProgress` ticks fire as each entry finishes. Refreshes the doc
+   *  + folder lists on completion. */
+  uploadArchive: (
+    file: File,
+    onProgress?: (p: ZipUploadProgress) => void,
+  ) => Promise<ZipManifest>;
   moveDocument: (docId: string, newFolderId: string | null) => Promise<void>;
   removeDocument: (docId: string) => Promise<void>;
 }
@@ -231,6 +271,31 @@ export function useMatter(matterId: string | undefined): UseMatterResult {
     [matterId],
   );
 
+  const uploadArchive = useCallback(
+    async (
+      file: File,
+      onProgress?: (p: ZipUploadProgress) => void,
+    ): Promise<ZipManifest> => {
+      if (!matterId) throw new Error('No matter id');
+      const form = new FormData();
+      form.append('file', file);
+      const response = await fetch(
+        `/api/matters/${encodeURIComponent(matterId)}/documents/upload-archive`,
+        { method: 'POST', credentials: 'include', body: form },
+      );
+      if (!response.ok || !response.body) {
+        const data = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(data.error || `Failed (${response.status})`);
+      }
+      const manifest = await consumeSseStream(response.body, onProgress);
+      // Refresh so the new folders + docs appear in the panel. Cheaper than
+      // optimistically threading 200+ inserts through setState.
+      await refresh();
+      return manifest;
+    },
+    [matterId, refresh],
+  );
+
   useEffect(() => {
     void refresh();
   }, [refresh]);
@@ -247,9 +312,68 @@ export function useMatter(matterId: string | undefined): UseMatterResult {
     moveFolder,
     deleteFolder,
     uploadDocument,
+    uploadArchive,
     moveDocument,
     removeDocument,
   };
+}
+
+async function consumeSseStream(
+  body: ReadableStream<Uint8Array>,
+  onProgress?: (p: ZipUploadProgress) => void,
+): Promise<ZipManifest> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let manifest: ZipManifest | null = null;
+  let errorPayload: { error?: string; message?: string } | null = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // SSE frames are separated by a blank line. Pull complete frames; leave
+    // any trailing partial frame in the buffer for the next chunk.
+    let idx = buffer.indexOf('\n\n');
+    while (idx !== -1) {
+      const frame = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      const parsed = parseSseFrame(frame);
+      if (parsed) {
+        if (parsed.event === 'progress' && onProgress) {
+          onProgress(parsed.data as ZipUploadProgress);
+        } else if (parsed.event === 'manifest') {
+          manifest = parsed.data as ZipManifest;
+        } else if (parsed.event === 'error') {
+          errorPayload = parsed.data as { error?: string; message?: string };
+        }
+      }
+      idx = buffer.indexOf('\n\n');
+    }
+  }
+  if (errorPayload) {
+    throw new Error(errorPayload.message || errorPayload.error || 'Archive upload failed');
+  }
+  if (!manifest) {
+    throw new Error('Archive upload ended without a manifest event');
+  }
+  return manifest;
+}
+
+function parseSseFrame(frame: string): { event: string; data: unknown } | null {
+  let event = 'message';
+  const dataLines: string[] = [];
+  for (const raw of frame.split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+  }
+  if (dataLines.length === 0) return null;
+  try {
+    return { event, data: JSON.parse(dataLines.join('\n')) };
+  } catch {
+    return null;
+  }
 }
 
 function collectDescendants(folders: MatterFolder[], rootId: string): Set<string> {

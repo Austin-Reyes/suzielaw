@@ -7,6 +7,7 @@ import {
   type DbHandle,
 } from '@counsel/db';
 import type { KbDB } from '@counsel/kb';
+import type { AuditDB } from '@counsel/audit';
 import type { WorkspacesDB } from '@counsel/workspaces';
 import type { ChatsDB } from '@counsel/chats';
 import type { DocumentVersionsDB } from '@counsel/document-versions';
@@ -21,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 import { KnowledgeBaseStore, createOpenAIEmbedder } from '@counsel/kb';
+import { AuditStore } from '@counsel/audit';
 import { WorkspacesStore } from '@counsel/workspaces';
 import { ChatsStore } from '@counsel/chats';
 import { DocumentVersionsStore } from '@counsel/document-versions';
@@ -38,6 +40,7 @@ import { config } from './config.js';
  * to its slice via its own Kysely<TDB extends ScopedDB> generic.
  */
 export type AppDB = KbDB &
+  AuditDB &
   WorkspacesDB &
   ChatsDB &
   DocumentVersionsDB &
@@ -53,6 +56,7 @@ export interface CounselDbHandle {
   pool: Pool;
   stores: {
     kb: KnowledgeBaseStore;
+    audit: AuditStore;
     workspaces: WorkspacesStore;
     chats: ChatsStore;
     documentVersions: DocumentVersionsStore;
@@ -147,6 +151,7 @@ async function doBootstrap(): Promise<CounselDbHandle> {
       // organized contracts where smaller chunks focus retrieval.
       chunker: { targetSize: 1000, overlap: 150, maxSize: 1600 },
     }),
+    audit: new AuditStore({ db: kysely }),
     workspaces: new WorkspacesStore({ db: kysely }),
     chats: new ChatsStore({ db: kysely }),
     documentVersions: new DocumentVersionsStore({ db: kysely }),

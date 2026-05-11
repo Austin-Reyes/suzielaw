@@ -1,5 +1,5 @@
 import type { AnyToolDefinition } from '@teamsuzie/agent-loop';
-import type { FileRecord, InMemoryFileStore } from '../files.js';
+import type { FileRecord, FileStore } from '../files.js';
 import {
   runDocumentDiff,
   type DocumentDiffResult,
@@ -12,7 +12,7 @@ import {
 interface BuildOptions {
   /** Bucket id for the file store — matter id for matter/review chats, otherwise the chat sessionId. */
   sessionId: string;
-  fileStore: InMemoryFileStore;
+  fileStore: FileStore;
   markitdownBaseUrl: string;
   /** Author name written into every revision when the redline DOCX is generated. */
   redlineAuthor?: string;
@@ -63,13 +63,13 @@ export function buildDiffTools(opts: BuildOptions): AnyToolDefinition[] {
       additionalProperties: false,
     },
     async execute(args: { left_file_id: string; right_file_id: string }) {
-      const left = fileStore.get(sessionId, args.left_file_id);
+      const left = await fileStore.get(sessionId, args.left_file_id);
       if (!left) {
         throw new Error(
           `left_file_id not found in session: ${args.left_file_id}`,
         );
       }
-      const right = fileStore.get(sessionId, args.right_file_id);
+      const right = await fileStore.get(sessionId, args.right_file_id);
       if (!right) {
         throw new Error(
           `right_file_id not found in session: ${args.right_file_id}`,
@@ -89,6 +89,7 @@ export function buildDiffTools(opts: BuildOptions): AnyToolDefinition[] {
       let downloadUrl: string | null = null;
       let downloadFileId: string | null = null;
       let downloadFilename: string | null = null;
+      let downloadFileBytes: number | null = null;
       try {
         const redlineBytes = composeRedlineDocx({
           leftBytes: left.bytes,
@@ -110,9 +111,10 @@ export function buildDiffTools(opts: BuildOptions): AnyToolDefinition[] {
           bytes: redlineBytes,
           createdAt: Date.now(),
         };
-        fileStore.put(record);
+        await fileStore.put(record);
         downloadFileId = fileId;
         downloadFilename = filename;
+        downloadFileBytes = redlineBytes.length;
         const relativePath = `/api/files/${encodeURIComponent(sessionId)}/${encodeURIComponent(fileId)}/content`;
         downloadUrl = originUrl ? `${originUrl}${relativePath}` : relativePath;
       } catch (err) {
@@ -131,6 +133,7 @@ export function buildDiffTools(opts: BuildOptions): AnyToolDefinition[] {
         download_url: downloadUrl,
         download_file_id: downloadFileId,
         download_filename: downloadFilename,
+        bytes: downloadFileBytes,
       };
     },
   };

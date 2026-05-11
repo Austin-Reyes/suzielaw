@@ -1,11 +1,11 @@
 import type { AnyToolDefinition } from '@teamsuzie/agent-loop';
 import type { DocumentVersionsStore } from '@counsel/document-versions';
-import type { FileRecord, InMemoryFileStore } from '../files.js';
+import type { FileRecord, FileStore } from '../files.js';
 
 interface BuildOptions {
   /** File-store bucket id (matter id for matter chats, chat id otherwise). */
   sessionId: string;
-  fileStore: InMemoryFileStore;
+  fileStore: FileStore;
   /** Origin (e.g. http://localhost:17501) to make download_url absolute. */
   originUrl?: string;
   /** When set, the new copy is recorded as a `source: 'upload'` version
@@ -51,7 +51,7 @@ export function buildReplicateDocumentTools(
       additionalProperties: false,
     },
     async execute(args: { file_id: string; new_filename: string }) {
-      const record = fileStore.get(sessionId, args.file_id);
+      const record = await fileStore.get(sessionId, args.file_id);
       if (!record) {
         throw new Error(`file_id not found in session: ${args.file_id}`);
       }
@@ -72,7 +72,7 @@ export function buildReplicateDocumentTools(
         bytes: Buffer.from(record.bytes),
         createdAt: Date.now(),
       };
-      fileStore.put(newRecord);
+      await fileStore.put(newRecord);
 
       let versionId: string | undefined;
       if (documentVersions) {
@@ -100,6 +100,7 @@ export function buildReplicateDocumentTools(
         file_id: newFileId,
         filename: finalName,
         size: newRecord.size,
+        bytes: newRecord.size,
         download_url: downloadUrl,
         version_id: versionId,
         summary: `Copied ${record.name} → ${finalName}`,

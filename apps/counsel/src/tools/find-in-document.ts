@@ -1,12 +1,12 @@
 import type { AnyToolDefinition } from '@teamsuzie/agent-loop';
 import { bodyParagraphTexts, loadDocx } from '@teamsuzie/docx';
 import type { InMemoryDocumentStore } from '@teamsuzie/markdown-document';
-import type { InMemoryFileStore } from '../files.js';
+import type { FileStore } from '../files.js';
 
 interface BuildOptions {
   /** File-store bucket id (matter id for matter chats, chat id otherwise). */
   sessionId: string;
-  fileStore: InMemoryFileStore;
+  fileStore: FileStore;
   /** Document store (markdown view of converted binaries). */
   docStore: InMemoryDocumentStore;
 }
@@ -76,7 +76,7 @@ export function buildFindInDocumentTools(opts: BuildOptions): AnyToolDefinition[
       if (!query) throw new Error('query is required');
       const caseSensitive = args.case_sensitive === true;
 
-      const record = fileStore.get(sessionId, args.file_id);
+      const record = await fileStore.get(sessionId, args.file_id);
       if (!record) {
         throw new Error(`file_id not found in session: ${args.file_id}`);
       }

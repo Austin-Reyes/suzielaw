@@ -61,6 +61,7 @@ import {
   type DocumentDiffResult,
 } from '../components/compare-versions.js';
 import { ShareDialog } from '../components/share-dialog.js';
+import { ZipUploadPanel } from '../components/zip-upload-panel.js';
 import { useMatter, type MatterDocument, type MatterFolder } from '../hooks/use-matter.js';
 import { useReviews, type Review } from '../hooks/use-reviews.js';
 import { useMatterChats } from '../hooks/use-matter-chats.js';
@@ -864,6 +865,7 @@ export function MatterDetailPage() {
     renameFolder,
     deleteFolder,
     uploadDocument,
+    uploadArchive,
     moveDocument,
     moveFolder,
     removeDocument,
@@ -875,6 +877,15 @@ export function MatterDetailPage() {
   const [deleteTarget, setDeleteTarget] = useState<MatterFolder | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  // Active/settled state for an in-flight or just-finished zip upload. One
+  // at a time — if the user drops a second zip, the first manifest is
+  // replaced. (Pilot scope: zip drops are deliberate, not bulk.)
+  const [archiveState, setArchiveState] = useState<{
+    filename: string;
+    progress: import('../hooks/use-matter.js').ZipUploadProgress | null;
+    manifest: import('../hooks/use-matter.js').ZipManifest | null;
+    error: string | null;
+  } | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const { openDoc: openDocInPanel } = useDocSidePanel();
   const sidePanel = useSidePanel();
@@ -930,13 +941,54 @@ export function MatterDetailPage() {
     setUploadError(null);
     try {
       for (const file of Array.from(files)) {
-        await uploadDocument(file, currentFolderId);
+        if (isZip(file)) {
+          // Zips route through the SSE pipeline; the panel below shows
+          // progress and the final manifest. Folder choice ignored — the
+          // zip carries its own structure.
+          setArchiveState({
+            filename: file.name,
+            progress: null,
+            manifest: null,
+            error: null,
+          });
+          try {
+            const manifest = await uploadArchive(file, (p) =>
+              setArchiveState((cur) =>
+                cur && cur.filename === file.name
+                  ? { ...cur, progress: p }
+                  : cur,
+              ),
+            );
+            setArchiveState((cur) =>
+              cur && cur.filename === file.name
+                ? { ...cur, manifest, progress: null }
+                : cur,
+            );
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : 'Archive upload failed';
+            setArchiveState((cur) =>
+              cur && cur.filename === file.name
+                ? { ...cur, error: msg, progress: null }
+                : cur,
+            );
+          }
+        } else {
+          await uploadDocument(file, currentFolderId);
+        }
       }
     } catch (err) {
       setUploadError(err instanceof Error ? err.message : 'Upload failed');
     } finally {
       setUploading(false);
     }
+  }
+
+  function isZip(file: File): boolean {
+    return (
+      file.name.toLowerCase().endsWith('.zip') ||
+      file.type === 'application/zip' ||
+      file.type === 'application/x-zip-compressed'
+    );
   }
 
   const deleteContents = useMemo(() => {
@@ -1005,6 +1057,7 @@ export function MatterDetailPage() {
             ref={fileInputRef}
             type="file"
             multiple
+            accept=".pdf,.docx,.doc,.pptx,.xlsx,.txt,.md,.csv,.json,.html,.htm,.eml,.zip"
             className="hidden"
             onChange={(event) => {
               void handleFiles(event.target.files);
@@ -1055,6 +1108,15 @@ export function MatterDetailPage() {
       <AppShellContent className="px-6 pt-6 pb-12">
         {error && <p className="mb-4 text-sm text-destructive">{error}</p>}
         {uploadError && <p className="mb-4 text-sm text-destructive">{uploadError}</p>}
+        {archiveState && (
+          <ZipUploadPanel
+            zipFilename={archiveState.filename}
+            progress={archiveState.progress}
+            manifest={archiveState.manifest}
+            errorMessage={archiveState.error}
+            onDismiss={() => setArchiveState(null)}
+          />
+        )}
 
         {loading ? (
           <LoadingState variant="block">Loading matter…</LoadingState>
@@ -1119,7 +1181,8 @@ export function MatterDetailPage() {
                     <EmptyState>
                       <EmptyStateTitle>No documents here yet</EmptyStateTitle>
                       <EmptyStateDescription>
-                        Upload PDFs, DOCX, or other files to this matter.
+                        Upload PDFs, DOCX, or a Litify <code>.zip</code> export —
+                        folder structure is preserved.
                       </EmptyStateDescription>
                       <Button
                         className="mt-4"

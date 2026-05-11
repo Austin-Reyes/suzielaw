@@ -209,10 +209,32 @@ export class WorkspacesStore<TDB extends WorkspacesDB = WorkspacesDB> {
         name: input.name,
         mime_type: input.mimeType ?? null,
         size: input.size ?? null,
+        sha256: input.sha256 ?? null,
         position: input.position,
       })
       .execute();
     return (await this.getDocument(id))!;
+  }
+
+  /**
+   * Find an existing (non-deleted) document in this workspace whose bytes
+   * hash to `sha256`. Used by the zip-ingest path to skip re-ingesting
+   * files that were already uploaded under any path. Returns null when no
+   * match exists. The uq_workspace_documents_workspace_sha256 partial index
+   * makes this a single-row lookup.
+   */
+  async findDocumentBySha256(
+    workspaceId: string,
+    sha256: string,
+  ): Promise<WorkspaceDocument | null> {
+    const row = await this.kbDb()
+      .selectFrom('workspace_documents')
+      .selectAll()
+      .where('workspace_id', '=', workspaceId)
+      .where('sha256', '=', sha256)
+      .where('deleted_at', 'is', null)
+      .executeTakeFirst();
+    return row ? rowToDocument(row) : null;
   }
 
   async getDocument(id: string): Promise<WorkspaceDocument | null> {
@@ -309,6 +331,7 @@ interface DocumentRow {
   name: string;
   mime_type: string | null;
   size: string | null;
+  sha256: string | null;
   position: number;
   added_at: Date;
 }
@@ -345,6 +368,7 @@ function rowToDocument(row: DocumentRow): WorkspaceDocument {
     name: row.name,
     mimeType: row.mime_type,
     size: row.size === null ? null : Number(row.size),
+    sha256: row.sha256,
     position: row.position,
     addedAt: row.added_at,
   };

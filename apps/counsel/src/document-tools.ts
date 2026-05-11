@@ -7,7 +7,7 @@ import {
   isDocxMimeType,
 } from '@teamsuzie/markdown-document';
 import type { AnyToolDefinition } from '@teamsuzie/agent-loop';
-import type { InMemoryFileStore, FileRecord } from './files.js';
+import type { FileRecord, FileStore } from './files.js';
 
 /**
  * Convert a session-stored binary file (DOCX directly via mammoth, anything
@@ -46,7 +46,7 @@ export async function convertFileToMarkdown(
 interface BuildOptions {
   /** Active session id (per chat turn). */
   sessionId: string;
-  fileStore: InMemoryFileStore;
+  fileStore: FileStore;
   docStore: InMemoryDocumentStore;
   /** markitdown-agent base URL, e.g. `http://localhost:3013`. Empty string disables conversion tools. */
   markitdownBaseUrl: string;
@@ -92,7 +92,7 @@ export function buildDocumentTools(opts: BuildOptions): AnyToolDefinition[] {
       additionalProperties: false,
     },
     async execute(args: { file_id: string }) {
-      const record = fileStore.get(sessionId, args.file_id);
+      const record = await fileStore.get(sessionId, args.file_id);
       if (!record) throw new Error(`file_id not found in session: ${args.file_id}`);
 
       const markdown = await convertFileToMarkdown(record, { markitdownBaseUrl });
@@ -143,11 +143,12 @@ export function buildDocumentTools(opts: BuildOptions): AnyToolDefinition[] {
       bytes,
       createdAt: Date.now(),
     };
-    fileStore.put(record);
+    await fileStore.put(record);
 
     return {
       file_id: fileId,
       filename: finalName,
+      bytes: bytes.length,
       download_url: `/api/files/${encodeURIComponent(sessionId)}/${encodeURIComponent(fileId)}/content`,
     };
   };

@@ -6,13 +6,13 @@ import {
   type ContentKeyedEdit,
 } from '@teamsuzie/docx';
 import type { DocumentVersionsStore } from '@counsel/document-versions';
-import type { FileRecord, InMemoryFileStore } from '../files.js';
+import type { FileRecord, FileStore } from '../files.js';
 import { findEditParagraphIndex } from '../redline-view.js';
 
 interface BuildOptions {
   /** Bucket id for the file store (matter id for matter chats, chat id otherwise). */
   sessionId: string;
-  fileStore: InMemoryFileStore;
+  fileStore: FileStore;
   /** Author name written into every revision. */
   redlineAuthor?: string;
   /** Origin (e.g. http://localhost:17501) to make download_url absolute. */
@@ -106,7 +106,7 @@ export function buildProposeEditsTools(
         reason?: string;
       }>;
     }) {
-      const record = fileStore.get(sessionId, args.file_id);
+      const record = await fileStore.get(sessionId, args.file_id);
       if (!record) {
         throw new Error(`file_id not found in session: ${args.file_id}`);
       }
@@ -199,7 +199,7 @@ export function buildProposeEditsTools(
         bytes: redlineBytes,
         createdAt: Date.now(),
       };
-      fileStore.put(newRecord);
+      await fileStore.put(newRecord);
 
       // Record this proposal as a version branched from the source
       // doc's most recent version (an upload, or a prior proposal if the
@@ -238,6 +238,7 @@ export function buildProposeEditsTools(
         download_file_id: newFileId,
         download_session_id: sessionId,
         download_filename: filename,
+        bytes: redlineBytes.length,
         version_id: versionId,
         summary:
           appliedCount === args.edits.length

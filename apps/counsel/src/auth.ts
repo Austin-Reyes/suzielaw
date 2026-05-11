@@ -119,6 +119,20 @@ export function getSessionUser(req: Request): SessionUser | null {
   return (req.session as { user?: SessionUser } | null)?.user ?? null;
 }
 
+export function isAdmin(req: Request): boolean {
+  const email = getSessionUser(req)?.email?.toLowerCase();
+  if (!email) return false;
+  return config.admin.emails.includes(email);
+}
+
+export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  if (!isAdmin(req)) {
+    res.status(403).json({ error: 'forbidden' });
+    return;
+  }
+  next();
+}
+
 export function createAuthRouter(opts?: { budget?: TokenBudgetStore }): Router {
   const router: Router = Router();
 
@@ -148,6 +162,7 @@ export function createAuthRouter(opts?: { budget?: TokenBudgetStore }): Router {
   });
 
   router.post('/auth/logout', (req, res) => {
+    req.audit?.('auth.logout', { metadata: {} });
     req.session = null;
     res.json({ ok: true });
   });

@@ -23,8 +23,11 @@ import {
   createSessionMiddleware,
   easyAuthBridgeMiddleware,
   getSessionUser,
+  isAdmin,
+  requireAdmin,
   requireAuth,
 } from './auth.js';
+import { createAuditMiddleware } from './audit.js';
 import {
   createCsrfMiddleware,
   createOAuthRouter,
@@ -39,6 +42,7 @@ import {
   createMatterUploadsRouter,
   InMemoryFileStore,
 } from './files.js';
+import { BlobFileStore } from './blob-file-store.js';
 import { InMemoryDocumentStore } from '@teamsuzie/markdown-document';
 import { buildDocumentTools } from './document-tools.js';
 import { buildCourtListenerTools } from './tools/courtlistener.js';
@@ -69,7 +73,7 @@ import type { WorkflowColumnConfig, WorkflowOutputMode } from '@counsel/workflow
 import { WORKFLOW_OUTPUT_MODES } from '@counsel/workflows';
 import { seedAndMigrateWorkflows } from './seed-workflows.js';
 import { parseResponse } from '@teamsuzie/citations';
-import type { FileRecord } from './files.js';
+import type { FileRecord, FileStore } from './files.js';
 import { MatterRag, type MatterDocIndexDB } from './matter-rag.js';
 import type { Kysely as KyselyType } from 'kysely';
 import { createKbRouter, createKbSearchTool } from './kb.js';
@@ -93,7 +97,14 @@ const clientDistDir = path.resolve(__dirname, '../client/dist');
 const counselDb = await bootstrapCounselDb();
 
 const approvals = new ApprovalQueue({ store: new InMemoryApprovalStore() });
-const fileStore = new InMemoryFileStore();
+// Local dev/test keep the fast InMemoryFileStore. Azure prod sets
+// COUNSEL_BLOB_STORAGE_ACCOUNT and stores bytes durably in Blob Storage.
+const fileStore: FileStore = process.env.COUNSEL_BLOB_STORAGE_ACCOUNT
+  ? new BlobFileStore({
+      account: process.env.COUNSEL_BLOB_STORAGE_ACCOUNT,
+      container: process.env.COUNSEL_BLOB_STORAGE_CONTAINER || 'matter-uploads',
+    })
+  : new InMemoryFileStore();
 const docStore = new InMemoryDocumentStore();
 const tokenBudget = new TokenBudgetStore(db, config.tokenBudget.defaultLimit);
 
@@ -128,6 +139,7 @@ if (personaRegistry.listBuiltins().length > 0) {
 
 // Per-user model-endpoint overrides (the editable config behind each Local row).
 const modelSettings = counselDb.stores.modelSettings;
+const auditStore = counselDb.stores.audit;
 
 // Workspaces (legal apps surface them as "Matters") — backed by
 // @counsel/workspaces. The /api/matters surface is inlined below
@@ -197,6 +209,12 @@ function createCounselChatsRouter(
       personaId = typeof raw === 'string' && raw.length > 0 ? raw : null;
     }
     const chat = await chats.createChat({ workspaceId, name, personaId });
+    const matterId = (req as unknown as { _matterId?: string })._matterId;
+    req.audit('chat.create', {
+      subjectType: 'chat',
+      subjectId: chat.id,
+      metadata: matterId ? { matterId } : {},
+    });
     res.status(201).json({ item: chat });
   });
 
@@ -830,6 +848,50 @@ function activeTools(): AnyToolDefinition[] {
   return out;
 }
 
+function parseDateQuery(value: unknown): Date | undefined | false {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value !== 'string') return false;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? false : date;
+}
+
+function docxExportFromToolResult(
+  toolName: string,
+  result: unknown,
+): { fileId: string; bytes?: number } | null {
+  if (
+    ![
+      'export_to_docx',
+      'generate_docx',
+      'compare_documents',
+      'propose_document_edits',
+      'replicate_document',
+    ].includes(toolName)
+  ) {
+    return null;
+  }
+  if (!result || typeof result !== 'object') return null;
+  const record = result as Record<string, unknown>;
+  const filename =
+    typeof record.download_filename === 'string'
+      ? record.download_filename
+      : typeof record.filename === 'string'
+        ? record.filename
+        : '';
+  if (toolName === 'replicate_document' && !filename.toLowerCase().endsWith('.docx')) {
+    return null;
+  }
+  const fileId =
+    typeof record.download_file_id === 'string'
+      ? record.download_file_id
+      : typeof record.file_id === 'string'
+        ? record.file_id
+        : null;
+  if (!fileId) return null;
+  const bytes = typeof record.bytes === 'number' ? record.bytes : undefined;
+  return { fileId, ...(bytes !== undefined ? { bytes } : {}) };
+}
+
 async function bootstrapTemplates(): Promise<void> {
   try {
     templateTools = await buildTemplateTools({ templatesDir: config.templates.dir });
@@ -903,6 +965,7 @@ app.use(createSessionMiddleware());
 // COUNSEL_TRUST_EASY_AUTH is unset (local dev). Must run BEFORE requireAuth
 // is reachable so the auto-populated session is visible to it.
 app.use(easyAuthBridgeMiddleware({ budget: tokenBudget }));
+app.use('/api', createAuditMiddleware(auditStore));
 app.use(createCsrfMiddleware({ cookieName: 'suzielaw.csrf' }));
 app.use('/api', createAuthRouter({ budget: tokenBudget }));
 app.use(
@@ -946,12 +1009,19 @@ app.use(
       res.status(401).json({ error: 'unauthorized' });
       return;
     }
+    // BYOK is admin-only in the firm pilot (single firm-paid BAA-covered
+    // OpenAI/Anthropic key). Non-admins get an empty list so the settings
+    // UI hides the card without an error toast.
+    if (!isAdmin(req)) {
+      res.json({ providers: [] });
+      return;
+    }
     res.json({
       providers: await modelSettings.publicProviderKeys(ownerId, CLOUD_PROVIDER_IDS),
     });
   });
 
-  app.put('/api/model-settings/providers/:providerId', requireAuth, async (req, res) => {
+  app.put('/api/model-settings/providers/:providerId', requireAuth, requireAdmin, async (req, res) => {
     const ownerId = getSessionUser(req)?.email;
     if (!ownerId) {
       res.status(401).json({ error: 'unauthorized' });
@@ -974,7 +1044,7 @@ app.use(
     });
   });
 
-  app.delete('/api/model-settings/providers/:providerId', requireAuth, async (req, res) => {
+  app.delete('/api/model-settings/providers/:providerId', requireAuth, requireAdmin, async (req, res) => {
     const ownerId = getSessionUser(req)?.email;
     if (!ownerId) {
       res.status(401).json({ error: 'unauthorized' });
@@ -997,10 +1067,17 @@ app.use(
       res.status(401).json({ error: 'unauthorized' });
       return;
     }
+    // Per-model URL/key overrides are admin-only (same posture as BYOK
+    // provider keys above — letting attorneys override the firm model's
+    // base URL would route firm work outside the BAA umbrella).
+    if (!isAdmin(req)) {
+      res.json({ settings: [] });
+      return;
+    }
     res.json({ settings: await modelSettings.publicSettings(ownerId) });
   });
 
-  app.put('/api/model-settings/:modelId', requireAuth, async (req, res) => {
+  app.put('/api/model-settings/:modelId', requireAuth, requireAdmin, async (req, res) => {
     const ownerId = getSessionUser(req)?.email;
     if (!ownerId) {
       res.status(401).json({ error: 'unauthorized' });
@@ -1025,7 +1102,7 @@ app.use(
     res.json({ settings: await modelSettings.publicSettings(ownerId) });
   });
 
-  app.delete('/api/model-settings/:modelId', requireAuth, async (req, res) => {
+  app.delete('/api/model-settings/:modelId', requireAuth, requireAdmin, async (req, res) => {
     const ownerId = getSessionUser(req)?.email;
     if (!ownerId) {
       res.status(401).json({ error: 'unauthorized' });
@@ -1070,6 +1147,11 @@ app.post('/api/matters', requireAuth, async (req, res) => {
     userId,
     role: 'owner',
     grantedBy: userId,
+  });
+  req.audit('matter.create', {
+    subjectType: 'matter',
+    subjectId: created.id,
+    metadata: {},
   });
   res.status(201).json({ item: created });
 });
@@ -1130,14 +1212,14 @@ async function onMatterDocumentRemoved(
       err instanceof Error ? err.message : err,
     );
   }
-  const filesRemoved = fileStore.delete(workspace.id, doc.externalDocId);
+  const filesRemoved = await fileStore.delete(workspace.id, doc.externalDocId);
   const reviewRowsRemoved = await reviews.removeDocumentsByExternalId(
     workspace.id,
     doc.externalDocId,
   );
   if (filesRemoved || reviewRowsRemoved > 0) {
     console.log(
-      `[matter] cleaned up ${doc.name}: ${filesRemoved ? 'file bytes,' : ''} ${reviewRowsRemoved} review row(s)`,
+      `[matter] cleaned up file_id=${doc.externalDocId}: ${filesRemoved ? 'file bytes,' : ''} ${reviewRowsRemoved} review row(s)`,
     );
   }
 }
@@ -1233,12 +1315,18 @@ app.post('/api/matters/:id/unarchive', async (req, res) => {
 
 app.delete('/api/matters/:id', async (req, res) => {
   const id = String(req.params.id ?? '');
+  const docCount = (await workspaces.listDocuments(id, {})).length;
   const ok = await workspaces.deleteWorkspace(id);
   if (!ok) {
     res.status(404).json({ error: 'not_found' });
     return;
   }
   await onMatterRemoved(id);
+  req.audit('matter.delete', {
+    subjectType: 'matter',
+    subjectId: id,
+    metadata: { docCount },
+  });
   res.json({ ok: true });
 });
 
@@ -1296,6 +1384,11 @@ app.get('/api/matters/:id/documents', async (req, res) => {
     res.status(404).json({ error: 'not_found' });
     return;
   }
+  req.audit('matter.open', {
+    subjectType: 'matter',
+    subjectId: String(req.params.id ?? ''),
+    metadata: {},
+  });
   const folderRaw = req.query.folder;
   let folderId: string | null | undefined;
   if (folderRaw === undefined) {
@@ -1445,6 +1538,7 @@ app.use(
     fileStore,
     workspaces,
     maxUploadBytes: config.files.maxUploadBytes,
+    markitdownBaseUrl: config.markitdown.baseUrl,
     rag: matterRag,
     documentVersions,
   }),
@@ -1773,10 +1867,10 @@ app.use('/api/files', requireAuth);
 // DOCX bytes living in the file store; both routes mutate or read by
 // `:sessionId/:fileId`. Mounted before the generic files router so the
 // more specific paths match first.
-app.get('/api/files/:sessionId/:fileId/redline-view', requireAuth, (req, res) => {
+app.get('/api/files/:sessionId/:fileId/redline-view', requireAuth, async (req, res) => {
   const sessionId = String(req.params.sessionId ?? '');
   const fileId = String(req.params.fileId ?? '');
-  const rec = fileStore.get(sessionId, fileId);
+  const rec = await fileStore.get(sessionId, fileId);
   if (!rec) {
     res.status(404).json({ error: 'not_found' });
     return;
@@ -1806,7 +1900,7 @@ app.post(
   async (req, res) => {
     const sessionId = String(req.params.sessionId ?? '');
     const fileId = String(req.params.fileId ?? '');
-    const rec = fileStore.get(sessionId, fileId);
+    const rec = await fileStore.get(sessionId, fileId);
     if (!rec) {
       res.status(404).json({ error: 'not_found' });
       return;
@@ -1843,7 +1937,7 @@ app.post(
       // Mutate in place — same fileId, same bucket. The download_url
       // returned by the original tool call stays valid; the bytes behind
       // it are now the post-resolution version.
-      fileStore.put({
+      await fileStore.put({
         ...rec,
         bytes: newBytes,
         size: newBytes.length,
@@ -1902,7 +1996,20 @@ if (config.kb.enabled) {
   );
 }
 
-app.get('/api/health', async (_req, res) => {
+app.get('/api/health', async (req, res) => {
+  // Firm-pilot posture: BYOK provider list + per-model overrides are
+  // admin-only. Non-admins see an empty cloudProviders list so the
+  // Settings page hides the BYOK card via its existing `length > 0` guard.
+  const admin = isAdmin(req);
+  const cloudProvidersForCaller = admin
+    ? CLOUD_PROVIDERS.map((p) => ({
+        id: p.id,
+        label: p.label,
+        modelIds: p.modelIds,
+        ...(p.hint ? { hint: p.hint } : {}),
+        ...(p.keyUrl ? { keyUrl: p.keyUrl } : {}),
+      }))
+    : [];
   try {
     let reachable = false;
     let runtimeError = '';
@@ -1953,13 +2060,8 @@ app.get('/api/health', async (_req, res) => {
         Object.entries(config.modelAgents).map(([id, t]) => [id, { baseUrl: t.baseUrl }]),
       ),
       authProviders: config.oauth.providers.map((p) => ({ id: p.id, label: p.label })),
-      cloudProviders: CLOUD_PROVIDERS.map((p) => ({
-        id: p.id,
-        label: p.label,
-        modelIds: p.modelIds,
-        ...(p.hint ? { hint: p.hint } : {}),
-        ...(p.keyUrl ? { keyUrl: p.keyUrl } : {}),
-      })),
+      cloudProviders: cloudProvidersForCaller,
+      isAdmin: admin,
       demo: config.demo.password ? { email: config.demo.email, password: config.demo.password } : undefined,
     });
   } catch (error) {
@@ -1989,13 +2091,8 @@ app.get('/api/health', async (_req, res) => {
         Object.entries(config.modelAgents).map(([id, t]) => [id, { baseUrl: t.baseUrl }]),
       ),
       authProviders: config.oauth.providers.map((p) => ({ id: p.id, label: p.label })),
-      cloudProviders: CLOUD_PROVIDERS.map((p) => ({
-        id: p.id,
-        label: p.label,
-        modelIds: p.modelIds,
-        ...(p.hint ? { hint: p.hint } : {}),
-        ...(p.keyUrl ? { keyUrl: p.keyUrl } : {}),
-      })),
+      cloudProviders: cloudProvidersForCaller,
+      isAdmin: admin,
       demo: config.demo.password ? { email: config.demo.email, password: config.demo.password } : undefined,
     });
   }
@@ -2020,14 +2117,18 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   // When set, this is a matter-scoped persisted chat. Server auto-attaches
   // matter docs and persists user + assistant messages on completion.
   const chatId = String(req.body?.chatId || '').trim();
-  // Per-request model override (from the Settings model picker). The
-  // default model is always allowed — it's the demo-budget path. Other
-  // models are accepted only when the user has a BYOK key for the
-  // model's provider; the chat then routes to the provider's public
-  // endpoint with the user's key, bypassing demo metering.
+  // Per-request model override (from the Settings model picker). Allowed
+  // when the requested id is either (a) the default chat model, (b) a
+  // firm-approved cloud model (routes via firm-paid BAA-covered key in
+  // config.modelAgents — no per-user key required), or (c) a model the
+  // user has set their own BYOK key for. (c) is admin-only in the firm
+  // pilot, but we keep the path so the admin can still test BYOK.
   const requestedModelRaw = String(req.body?.model || '').trim();
   const sessionEmailEarly = getSessionUser(req)?.email;
-  if (requestedModelRaw && requestedModelRaw !== config.agent.model) {
+  const isFirmApproved =
+    requestedModelRaw === config.agent.model ||
+    config.firmCloudModelIds.includes(requestedModelRaw);
+  if (requestedModelRaw && !isFirmApproved) {
     const provider = providerForModel(requestedModelRaw);
     const hasUserKey = !!(
       provider &&
@@ -2037,7 +2138,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     if (!provider || !hasUserKey) {
       res.status(400).json({
         error: 'model_not_allowed',
-        allowed: [config.agent.model],
+        allowed: [config.agent.model, ...config.firmCloudModelIds],
         message: provider
           ? `Add your ${provider.label} key in Settings to use ${requestedModelRaw}.`
           : `Model ${requestedModelRaw} is not configured for this app.`,
@@ -2129,7 +2230,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   // Per-turn paperclip uploads (chat session bucket).
   const turnAttachments: FileRecord[] =
     sessionId && attachmentIds.length > 0
-      ? fileStore.getMany(sessionId, attachmentIds)
+      ? await fileStore.getMany(sessionId, attachmentIds)
       : [];
 
   // Persisted-chat attachment: matter-scoped chats auto-attach every doc
@@ -2165,13 +2266,13 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       }
       chatBucketMatterId = review.workspaceId;
       for (const doc of await reviews.listDocuments(reviewId)) {
-        const rec = fileStore.get(chatBucketMatterId, doc.externalDocId);
+        const rec = await fileStore.get(chatBucketMatterId, doc.externalDocId);
         if (rec) matterAttachments.push(rec);
       }
     } else {
       chatBucketMatterId = persistedChat.workspaceId;
       for (const doc of await workspaces.listDocuments(chatBucketMatterId, {})) {
-        const rec = fileStore.get(chatBucketMatterId, doc.externalDocId);
+        const rec = await fileStore.get(chatBucketMatterId, doc.externalDocId);
         if (rec) matterAttachments.push(rec);
       }
     }
@@ -2180,6 +2281,15 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   // user's per-render session bucket (paperclip uploads), which is what
   // the docTools / file URLs already use.
   const docToolsSession = chatBucketMatterId || sessionId;
+  req.audit('chat.message', {
+    ...(persistedChat
+      ? { subjectType: 'chat', subjectId: persistedChat.id }
+      : {}),
+    metadata: {
+      ...(chatBucketMatterId ? { matterId: chatBucketMatterId } : {}),
+      model: agent.model,
+    },
+  });
 
   // Dedupe by file id so a paperclip upload that's also a matter doc doesn't
   // appear twice in the [Attachments] block.
@@ -2326,6 +2436,20 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           collectedToolEvents.push(event);
         }
       }
+      if (event.type === 'tool_result' && chatBucketMatterId) {
+        const docxExport = docxExportFromToolResult(event.name, event.result);
+        if (docxExport) {
+          req.audit('export.docx', {
+            subjectType: 'matter',
+            subjectId: chatBucketMatterId,
+            metadata: {
+              ...(workflowId ? { template: workflowId } : {}),
+              model: agent.model,
+              ...(docxExport.bytes !== undefined ? { bytes: docxExport.bytes } : {}),
+            },
+          });
+        }
+      }
       if (event.type === 'done' || event.type === 'error') break;
     }
   } catch (error) {
@@ -2456,6 +2580,50 @@ app.post('/api/approvals/:id/review', async (req, res) => {
  * K kb chunks". Personas, prompts, model-settings survive — those feel
  * more like configuration than content.
  */
+app.get('/api/admin/audit-log', requireAuth, async (req, res) => {
+  const requester = getSessionUser(req)?.email.toLowerCase();
+  if (!requester || !config.admin.emails.includes(requester)) {
+    res.status(403).json({ error: 'forbidden' });
+    return;
+  }
+
+  const since = parseDateQuery(req.query.since);
+  const until = parseDateQuery(req.query.until);
+  if (since === false || until === false) {
+    res.status(400).json({ error: 'since/until must be valid ISO timestamps' });
+    return;
+  }
+
+  const limitRaw = req.query.limit;
+  const limit =
+    typeof limitRaw === 'string' && limitRaw.trim()
+      ? Number(limitRaw)
+      : undefined;
+  if (limit !== undefined && (!Number.isFinite(limit) || limit <= 0)) {
+    res.status(400).json({ error: 'limit must be a positive number' });
+    return;
+  }
+
+  const actor = typeof req.query.actor === 'string' ? req.query.actor.trim().toLowerCase() : '';
+  const event = typeof req.query.event === 'string' ? req.query.event.trim() : '';
+  const subjectType =
+    typeof req.query.subjectType === 'string' ? req.query.subjectType.trim() : '';
+  const subjectId =
+    typeof req.query.subjectId === 'string' ? req.query.subjectId.trim() : '';
+
+  res.json({
+    items: await auditStore.query({
+      ...(actor ? { actorEmail: actor } : {}),
+      ...(event ? { event } : {}),
+      ...(subjectType ? { subjectType } : {}),
+      ...(subjectId ? { subjectId } : {}),
+      ...(since ? { since } : {}),
+      ...(until ? { until } : {}),
+      ...(limit ? { limit } : {}),
+    }),
+  });
+});
+
 app.post('/api/admin/reset', requireAuth, async (_req, res) => {
   const startedAt = Date.now();
   console.log('[admin/reset] starting full content wipe');
@@ -2485,7 +2653,7 @@ app.post('/api/admin/reset', requireAuth, async (_req, res) => {
     await counselDb.kysely.deleteFrom('workspaces').execute();
     // 3. File bytes (in-memory + disk persistence). docStore lives per
     //    chat session and ages out naturally, so we don't touch it here.
-    const filesDeleted = fileStore.clearAll();
+    const filesDeleted = await fileStore.clearAll();
     const elapsed = Date.now() - startedAt;
     console.log(
       `[admin/reset] complete in ${elapsed}ms: ${kbDocsDeleted} kb doc(s), ${kbChunksDeleted} chunk(s), ${filesDeleted} file(s)`,
@@ -2685,8 +2853,10 @@ app.post(
       });
       return;
     }
-    const left = fileStore.get(matterId, leftFileId);
-    const right = fileStore.get(matterId, rightFileId);
+    const [left, right] = await Promise.all([
+      fileStore.get(matterId, leftFileId),
+      fileStore.get(matterId, rightFileId),
+    ]);
     if (!left) {
       res.status(404).json({ error: `leftFileId not found: ${leftFileId}` });
       return;
@@ -2746,8 +2916,10 @@ app.get(
       });
       return;
     }
-    const left = fileStore.get(matterId, leftFileId);
-    const right = fileStore.get(matterId, rightFileId);
+    const [left, right] = await Promise.all([
+      fileStore.get(matterId, leftFileId),
+      fileStore.get(matterId, rightFileId),
+    ]);
     if (!left || !right) {
       res.status(404).json({
         error: !left
@@ -2775,6 +2947,11 @@ app.get(
         'Content-Disposition',
         `attachment; filename="${filename}"`,
       );
+      req.audit('export.docx', {
+        subjectType: 'matter',
+        subjectId: matterId,
+        metadata: { bytes: bytes.length },
+      });
       res.send(bytes);
     } catch (err) {
       console.warn(
@@ -2872,10 +3049,10 @@ app.post('/api/reviews/column/draft-prompt', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/session/reset', (req, res) => {
+app.post('/api/session/reset', async (req, res) => {
   const sessionId = String(req.body?.sessionId || '').trim();
   if (sessionId) {
-    fileStore.clearSession(sessionId);
+    await fileStore.clearSession(sessionId);
     docStore.clearSession(sessionId);
   }
   res.json({ ok: true });

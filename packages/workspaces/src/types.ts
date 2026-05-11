@@ -33,6 +33,9 @@ export interface WorkspaceDocument {
   name: string;
   mimeType: string | null;
   size: number | null;
+  /** SHA-256 of the file bytes, hex-encoded. Null for legacy rows + non-archive
+   *  uploads. Used by the zip-ingest path to skip re-ingesting identical bytes. */
+  sha256: string | null;
   position: number;
   addedAt: Date;
 }
@@ -67,6 +70,7 @@ export interface AddDocumentInput {
   name: string;
   mimeType?: string | null;
   size?: number | null;
+  sha256?: string | null;
   position?: number;
 }
 
@@ -122,6 +126,7 @@ export interface WorkspaceDocumentsTable {
   name: string;
   mime_type: string | null;
   size: ColumnType<string | null, string | number | bigint | null, string | number | bigint | null>;
+  sha256: string | null;
   position: Generated<number>;
   added_at: Generated<Date>;
   deleted_at: Timestamp | null;
